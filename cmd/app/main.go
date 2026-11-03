@@ -44,6 +44,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	return nil, nil
 }
 
 func (m model) Init() tea.Cmd {
@@ -51,5 +52,5 @@ func (m model) Init() tea.Cmd {
 }
 
 func main() {
-	fmt.Println("hello world")
+	fmt.Println("hello world test")
 }
