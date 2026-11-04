@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -18,6 +19,15 @@ func initialModel() model {
 		selected: map[int]bool{},
 		cursor:   0,
 	}
+}
+
+func hasGitRepo() bool {
+	exists, err := os.ReadDir("./.git")
+	if err != nil {
+		return false
+	}
+
+	return len(exists) > 0
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -76,6 +86,8 @@ func (m model) Init() tea.Cmd {
 }
 
 func main() {
+	fmt.Println(hasGitRepo())
+
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
 		panic(err)
