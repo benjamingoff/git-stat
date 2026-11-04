@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
-	"log"
 	"os"
-	"slices"
+	"path/filepath"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -89,26 +90,59 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
-func getFilePaths(root string) []string {
-	return []string{}
+func countLines(filePath string) int64 {
+	file, err := os.ReadFile(filePath)
+	if err != nil {
+		return 0
+	}
+
+	reader := bytes.NewReader(file)
+	lineCount := 0
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(buffer)
+		if err != nil {
+			break
+		}
+		lineCount += bytes.Count(buffer[:n], []byte("\n"))
+	}
+	return int64(lineCount)
+}
+
+func getFilePaths(root string, excludeList []string) []string {
+	var filePaths []string
+	err := filepath.WalkDir(root, func(path string, dir os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		for _, exclude := range excludeList {
+			if strings.HasPrefix(path, exclude) {
+				return nil
+			}
+		}
+
+		if !dir.IsDir() {
+			filePaths = append(filePaths, path)
+		}
+		return nil
+	})
+
+	if err != nil {
+		fmt.Println(err)
+	}
+	return filePaths
 }
 
 func main() {
 	fmt.Println(hasGitRepo())
 
 	excludeList := []string{".git", ".idea"}
-	dirs, err := os.ReadDir(".")
-	if err != nil {
-		log.Fatal(err)
-	}
+	dirs := getFilePaths(".", excludeList)
 
 	for _, dir := range dirs {
-		if slices.Contains(excludeList, dir.Name()) {
-			fmt.Println("Skipping", dir.Name())
-			continue
-		}
-
-		fmt.Println(dir.Name())
+		lines := countLines(dir)
+		fmt.Println(dir, lines)
 	}
 
 	p := tea.NewProgram(initialModel())
