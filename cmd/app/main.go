@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"slices"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -29,6 +31,8 @@ func hasGitRepo() bool {
 
 	return len(exists) > 0
 }
+
+func lineCounter() {}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -85,8 +89,27 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
+func getFilePaths(root string) []string {
+	return []string{}
+}
+
 func main() {
 	fmt.Println(hasGitRepo())
+
+	excludeList := []string{".git", ".idea"}
+	dirs, err := os.ReadDir(".")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, dir := range dirs {
+		if slices.Contains(excludeList, dir.Name()) {
+			fmt.Println("Skipping", dir.Name())
+			continue
+		}
+
+		fmt.Println(dir.Name())
+	}
 
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
