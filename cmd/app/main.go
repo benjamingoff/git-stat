@@ -36,8 +36,6 @@ func hasGitRepo() bool {
 	return len(exists) > 0
 }
 
-func lineCounter() {}
-
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -112,16 +110,21 @@ func countLines(filePath string) int64 {
 	return int64(lineCount)
 }
 
-func getFilePaths(root string, excludeList []string) []string {
+func getFilePaths(root string, excludeList []string, explicitFileTypes map[string]bool) []string {
 	var filePaths []string
 	err := filepath.WalkDir(root, func(path string, dir os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
+		if len(explicitFileTypes) > 0 {
+			ft, err := getFileType(path)
+			if err != nil || !explicitFileTypes[ft] {
+				return nil
+			}
+		}
+
 		for _, exclude := range excludeList {
-			//fmt.Println(root + path)
-			//fmt.Println(exclude)
 			if strings.HasPrefix(path, root+exclude) {
 				return nil
 			}
@@ -174,7 +177,8 @@ func main() {
 
 	//excludeList := []string{"/.git", "/.idea", "/frontend/node_modules", "/.venv", "/frontend/src/generated", "/.opencode"}
 	excludeList := []string{}
-	dirs := getFilePaths("../SoloCharts", excludeList)
+	explicitFileTypes := map[string]bool{"go": true, "tsx": true, "ts": true}
+	dirs := getFilePaths("../SoloCharts", excludeList, explicitFileTypes)
 
 	fileCh := make(chan string, len(dirs))
 	for _, dir := range dirs {
@@ -198,6 +202,10 @@ func main() {
 		}()
 	}
 	wg.Wait()
+
+	for ft, lines := range fileLineCounter.files {
+		fmt.Printf("%s: %d\n", ft, lines)
+	}
 
 	fmt.Printf("Time taken: %v\n", time.Since(start))
 	p := tea.NewProgram(initialModel())
