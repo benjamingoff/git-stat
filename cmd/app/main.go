@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -171,24 +172,34 @@ func main() {
 
 	fileLineCounter := NewFileLineCounter()
 
-	excludeList := []string{"/.git", "/.idea", "/frontend/node_modules", "/.venv", "/frontend/src/generated", "/.opencode"}
+	//excludeList := []string{"/.git", "/.idea", "/frontend/node_modules", "/.venv", "/frontend/src/generated", "/.opencode"}
+	excludeList := []string{}
 	dirs := getFilePaths("../SoloCharts", excludeList)
 
+	fileCh := make(chan string, len(dirs))
 	for _, dir := range dirs {
-		lines := countLines(dir)
-		fileType, err := getFileType(dir)
-		if err != nil {
-			fmt.Println(err)
-			continue
-		}
-		fileLineCounter.UpdateFileLineCount(fileType, lines)
+		fileCh <- dir
 	}
+	close(fileCh)
+
+	workerCount := runtime.NumCPU()
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+
+	for range workerCount {
+		go func() {
+			defer wg.Done()
+			for path := range fileCh {
+				lines := countLines(path)
+				if ft, err := getFileType(path); err == nil {
+					fileLineCounter.UpdateFileLineCount(ft, lines)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
 	fmt.Printf("Time taken: %v\n", time.Since(start))
-
-	for fileType, lines := range fileLineCounter.files {
-		fmt.Printf("%s: %d\n", fileType, lines)
-	}
-
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
 		panic(err)
