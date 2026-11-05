@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -117,7 +119,9 @@ func getFilePaths(root string, excludeList []string) []string {
 		}
 
 		for _, exclude := range excludeList {
-			if strings.HasPrefix(path, exclude) {
+			//fmt.Println(root + path)
+			//fmt.Println(exclude)
+			if strings.HasPrefix(path, root+exclude) {
 				return nil
 			}
 		}
@@ -134,15 +138,55 @@ func getFilePaths(root string, excludeList []string) []string {
 	return filePaths
 }
 
+type FileLineCounter struct {
+	mu    sync.Mutex
+	files map[string]int64
+}
+
+func NewFileLineCounter() *FileLineCounter {
+	return &FileLineCounter{
+		files: make(map[string]int64),
+	}
+}
+
+func (f *FileLineCounter) UpdateFileLineCount(fileType string, lines int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.files[fileType] = f.files[fileType] + lines
+}
+
+func getFileType(filePath string) (string, error) {
+	split := strings.Split(filePath, ".")
+	if len(split) > 0 {
+		return split[len(split)-1], nil
+	}
+
+	return "", fmt.Errorf("file type not found")
+}
+
 func main() {
 	fmt.Println(hasGitRepo())
+	start := time.Now()
 
-	excludeList := []string{".git", ".idea"}
-	dirs := getFilePaths(".", excludeList)
+	fileLineCounter := NewFileLineCounter()
+
+	excludeList := []string{"/.git", "/.idea", "/frontend/node_modules", "/.venv", "/frontend/src/generated", "/.opencode"}
+	dirs := getFilePaths("../SoloCharts", excludeList)
 
 	for _, dir := range dirs {
 		lines := countLines(dir)
-		fmt.Println(dir, lines)
+		fileType, err := getFileType(dir)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		fileLineCounter.UpdateFileLineCount(fileType, lines)
+	}
+	fmt.Printf("Time taken: %v\n", time.Since(start))
+
+	for fileType, lines := range fileLineCounter.files {
+		fmt.Printf("%s: %d\n", fileType, lines)
 	}
 
 	p := tea.NewProgram(initialModel())
