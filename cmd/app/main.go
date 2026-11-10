@@ -1,8 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"time"
+	"os"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -10,17 +11,20 @@ import (
 )
 
 type model struct {
-	choices  []string
-	selected map[int]bool
+	repos    []string
 	cursor   int
+	selected string
 }
 
-func initialModel() model {
+func initialModel(repos []string) model {
 	return model{
-		choices:  []string{"carrots", "beans", "soda"},
-		selected: map[int]bool{},
-		cursor:   0,
+		repos:  repos,
+		cursor: 0,
 	}
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -38,16 +42,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "down":
-			if m.cursor < len(m.choices)-1 {
+			if m.cursor < len(m.repos)-1 {
 				m.cursor++
 			}
 
 		case "enter":
-			if m.selected[m.cursor] == true {
-				m.selected[m.cursor] = false
-			} else {
-				m.selected[m.cursor] = true
+			if m.cursor < len(m.repos) {
+				m.selected = m.repos[m.cursor]
 			}
+			return m, tea.Quit
 		}
 	}
 
@@ -55,34 +58,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() tea.View {
-	s := "Header for the question\n"
+	s := "Select a git repository:\n\n"
 
-	for i, choice := range m.choices {
+	if len(m.repos) == 0 {
+		s += "No git repositories found.\n"
+	}
+
+	for i, repo := range m.repos {
 		cursor := " "
 		if m.cursor == i {
 			cursor = ">"
 		}
-
-		checked := " "
-		if m.selected[i] == true {
-			checked = "x"
-		}
-		s += fmt.Sprintf("%s [%s] %s\n", cursor, checked, choice)
+		s += fmt.Sprintf("%s %s\n", cursor, repo)
 	}
 
-	s += "\nPress q to quit.\n"
+	s += "\nPress enter to select, q to quit.\n"
 	return tea.NewView(s)
 }
 
-func (m model) Init() tea.Cmd {
-	return nil
-}
-
 func main() {
-	fmt.Println(parser.GetGitDirPaths("~/"))
-	start := time.Now()
+	repos := parser.GetGitDirPaths("~/Documents")
 
-	if err := run(start); err != nil {
+	p := tea.NewProgram(initialModel(repos))
+	finalModel, err := p.Run()
+	if err != nil {
 		panic(err)
 	}
+
+	m, ok := finalModel.(model)
+	if !ok || m.selected == "" {
+		return
+	}
+
+	explicitFileTypes := map[string]bool{"go": true, "ts": true, "tsx": true, "py": true}
+	days, err := parser.LocOverTime(m.selected, explicitFileTypes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to compute LOC timeline for %s: %v\n", m.selected, err)
+		os.Exit(1)
+	}
+
+	printDayStats(m.selected, days)
+}
+
+// printDayStats dumps the per-day, per-file-type line counts as a JSON-ish
+// map, newest day first.
+func printDayStats(repo string, days []parser.DayStats) {
+	fmt.Println(repo)
+	fmt.Println("{")
+	for i := len(days) - 1; i >= 0; i-- {
+		b, _ := json.Marshal(days[i].Types)
+		comma := ","
+		if i == 0 {
+			comma = ""
+		}
+		fmt.Printf("  %q: %s%s\n", days[i].Date, b, comma)
+	}
+	fmt.Println("}")
 }
