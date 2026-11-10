@@ -25,6 +25,7 @@ func run(start time.Time) error {
 		fmt.Printf("%s: %d\n", ft, lines)
 	}
 
+	fmt.Println(parser.GetGitDirPaths("~/Documents"))
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {
 		return err

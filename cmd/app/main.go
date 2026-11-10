@@ -79,7 +79,7 @@ func (m model) Init() tea.Cmd {
 }
 
 func main() {
-	fmt.Println(parser.HasGitRepo())
+	fmt.Println(parser.GetGitDirPaths("~/"))
 	start := time.Now()
 
 	if err := run(start); err != nil {
