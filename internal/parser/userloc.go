@@ -32,9 +32,14 @@ func UserLocOverTime(repo string, includeTypes map[string]bool) ([]UserDayStats,
 }
 
 // UserLocOverTimeProgress behaves like UserLocOverTime but calls onDay with
-// each snapshot as soon as it is ready (in chronological order), so callers
-// can render progress live. done and total count days completed and expected.
-func UserLocOverTimeProgress(repo string, includeTypes map[string]bool, onDay func(done int, total int, stats UserDayStats)) ([]UserDayStats, error) {
+// each snapshot as soon as it is ready (in completion order, not
+// chronological), so callers can render progress live. done and total count
+// days completed and expected; idx is the snapshot's position in the final
+// chronological slice. The most recent day — what all-time summaries need —
+// is blamed up front and delivered first; the remaining days stream in as
+// their workers finish (older days tend to finish sooner, having less
+// history to trace).
+func UserLocOverTimeProgress(repo string, includeTypes map[string]bool, onDay func(done int, total int, idx int, stats UserDayStats)) ([]UserDayStats, error) {
 	return userLocOverTime(repo, includeTypes, onDay)
 }
 
@@ -44,7 +49,7 @@ type dayResult struct {
 	err  error
 }
 
-func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, int, UserDayStats)) ([]UserDayStats, error) {
+func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, int, int, UserDayStats)) ([]UserDayStats, error) {
 	commitsByDay, err := lastCommitPerDay(repo)
 	if err != nil {
 		return nil, err
@@ -57,18 +62,42 @@ func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, 
 	sort.Strings(days)
 	total := len(days)
 
-	// Fan the days out to one worker per CPU core. The results channel is
-	// buffered for everything in flight, so workers never block on us.
+	// Blame the most recent day up front so callers streaming progress get
+	// the all-time snapshot first, before the fan-out below starts. (Older
+	// days are cheaper to blame, so queue order alone would not guarantee
+	// this one arrives first.)
+	out := make([]UserDayStats, total)
+	firstErr := error(nil)
+	doneCount := 0
+	if total > 0 {
+		doneCount = 1
+		users, err := blameAuthorsAt(repo, commitsByDay[days[total-1]], includeTypes)
+		if err != nil {
+			firstErr = err
+		} else {
+			out[total-1] = UserDayStats{Date: flipDate(days[total-1]), Users: users}
+		}
+		if onDay != nil {
+			onDay(doneCount, total, total-1, out[total-1])
+		}
+	}
+
+	// Fan the remaining days out to one worker per logical CPU. Workers are
+	// mostly blocked waiting on `git blame` subprocesses, so more workers than
+	// cores is possible (blocked goroutines are cheap) — but measured on real
+	// repos it just adds disk/RAM contention without speeding things up. The
+	// results channel is buffered for everything in flight, so workers never
+	// block on us.
 	results := make(chan dayResult, total)
 	work := make(chan int, total)
-	for i := range days {
+	for i := total - 2; i >= 0; i-- {
 		work <- i
 	}
 	close(work)
 
 	workers := runtime.NumCPU()
-	if workers > total {
-		workers = total
+	if workers > total-1 {
+		workers = total - 1
 	}
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -87,34 +116,26 @@ func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, 
 	}
 
 	// Close results once the workers finish, without blocking emission: the
-	// reassembly below runs concurrently with them so snapshots stream out
-	// while later days are still being blamed.
+	// loop below runs concurrently with them so snapshots stream out while
+	// other days are still being blamed.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Reassemble in chronological order, emitting each snapshot to onDay as
-	// soon as its turn comes (later days may already be done and waiting).
-	out := make([]UserDayStats, 0, total)
-	pending := map[int]dayResult{}
-	nextIdx, firstErr := 0, error(nil)
+	// Forward each snapshot to onDay in completion order; callers place it at
+	// its idx. The returned slice is chronological (indexed by day).
 	for res := range results {
-		if res.err != nil && firstErr == nil {
-			firstErr = res.err
+		doneCount++
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+		} else {
+			out[res.idx] = res.snap
 		}
-		pending[res.idx] = res
-		for {
-			r, ok := pending[nextIdx]
-			if !ok {
-				break
-			}
-			delete(pending, nextIdx)
-			out = append(out, r.snap)
-			if onDay != nil {
-				onDay(nextIdx+1, total, r.snap)
-			}
-			nextIdx++
+		if onDay != nil {
+			onDay(doneCount, total, res.idx, res.snap)
 		}
 	}
 	return out, firstErr

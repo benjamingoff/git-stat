@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -30,8 +31,7 @@ type filesLoadedMsg struct {
 }
 
 type ownerTick struct {
-	done  int
-	total int
+	idx   int // position in the chronological day list
 	stats parser.UserDayStats
 }
 
@@ -45,12 +45,32 @@ type ownerRun struct {
 	err error
 }
 
+const (
+	viewLangs      = iota // line graph: LOC per language over time
+	viewOwners            // line graph: LOC per contributor over time
+	viewLangTable         // table: LOC per language on the selected day
+	viewOwnerTable        // table: LOC per contributor on the selected day
+)
+
+func viewName(v int) string {
+	switch v {
+	case viewLangs:
+		return "by language"
+	case viewOwners:
+		return "by contributor"
+	case viewLangTable:
+		return "language table"
+	default:
+		return "contributor table"
+	}
+}
+
 type chartModel struct {
 	repo         string
 	includeTypes map[string]bool
 
-	fileDays  []parser.DayStats     // fast single-pass stats; ready first
-	ownerDays []parser.UserDayStats // slow per-day blame; arrives live
+	fileDays   []parser.DayStats           // fast single-pass stats; ready first
+	ownerByDay map[int]parser.UserDayStats // day index -> snapshot; arrives out of order (newest first)
 
 	fileSeries  []string
 	fileColors  map[string]color.Color
@@ -59,9 +79,11 @@ type chartModel struct {
 
 	owner *ownerRun
 
-	cursor int
-	width  int
-	height int
+	view      int
+	cursor    int
+	rangeDays int // 0 = all time; otherwise days back from the last active day
+	width     int
+	height    int
 
 	filesLoaded bool
 	filesErr    error
@@ -91,8 +113,8 @@ func (m *chartModel) startOwners() tea.Cmd {
 	run := &ownerRun{ch: make(chan ownerTick, 64)}
 	m.owner = run
 	go func() {
-		_, err := parser.UserLocOverTimeProgress(m.repo, m.includeTypes, func(done, total int, s parser.UserDayStats) {
-			run.ch <- ownerTick{done: done, total: total, stats: s}
+		_, err := parser.UserLocOverTimeProgress(m.repo, m.includeTypes, func(done, total int, idx int, s parser.UserDayStats) {
+			run.ch <- ownerTick{idx: idx, stats: s}
 		})
 		run.err = err
 		close(run.ch)
@@ -133,7 +155,10 @@ func (m chartModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.startOwners()
 
 	case ownerTick:
-		m.ownerDays = append(m.ownerDays, msg.stats)
+		if m.ownerByDay == nil {
+			m.ownerByDay = map[int]parser.UserDayStats{}
+		}
+		m.ownerByDay[msg.idx] = msg.stats
 		m.buildOwnerSeries()
 		return m, m.nextOwnerTick()
 
@@ -154,9 +179,73 @@ func (m chartModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.fileDays)-1 {
 				m.cursor++
 			}
+		case "1":
+			m.setRange(7)
+		case "2":
+			m.setRange(30)
+		case "3":
+			m.setRange(90)
+		case "4":
+			m.setRange(365)
+		case "5":
+			m.setRange(0)
+		case "tab", "v":
+			m.view = (m.view + 1) % 4
+		case "shift+tab":
+			if m.view > 0 {
+				m.view--
+			} else {
+				m.view = 3
+			}
 		}
 	}
 	return m, nil
+}
+
+// setRange switches the visible time window and keeps the cursor inside it.
+func (m *chartModel) setRange(days int) {
+	m.rangeDays = days
+	if s := m.visibleStart(); m.cursor < s {
+		m.cursor = s
+	}
+}
+
+// visibleStart is the index of the first day within the current range,
+// anchored at the last active day (not today, so stale repos still show data).
+func (m chartModel) visibleStart() int {
+	if m.rangeDays == 0 || len(m.fileDays) == 0 {
+		return 0
+	}
+	cutoff := parseDay(m.fileDays[len(m.fileDays)-1].Date).AddDate(0, 0, -m.rangeDays)
+	for i, d := range m.fileDays {
+		if !parseDay(d.Date).Before(cutoff) {
+			return i
+		}
+	}
+	return len(m.fileDays)
+}
+
+func parseDay(date string) time.Time {
+	t, err := time.Parse("02-01-2006", date) // "DD-MM-YYYY"
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func rangeLabel(days int) string {
+	switch days {
+	case 7:
+		return "1w"
+	case 30:
+		return "1m"
+	case 90:
+		return "3m"
+	case 365:
+		return "1y"
+	default:
+		return "all time"
+	}
 }
 
 // buildFileSeries orders file types by total lines and assigns colors.
@@ -175,7 +264,7 @@ func (m *chartModel) buildFileSeries() {
 // stable color on first sight, so colors don't shuffle as data streams in.
 func (m *chartModel) buildOwnerSeries() {
 	totals := map[string]int64{}
-	for _, d := range m.ownerDays {
+	for _, d := range m.ownerByDay {
 		for a, n := range d.Users {
 			totals[a] += n
 		}
@@ -226,34 +315,65 @@ func (m chartModel) View() tea.View {
 	}
 
 	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render(m.repo+" — LOC over time") + "\n\n")
-
-	m.renderLegend(&b, "Files:", m.fileSeries, m.fileColors)
-	m.renderChart(&b, fileSnaps(m.fileDays), m.fileSeries, m.fileColors, m.barHeight())
-	b.WriteString("\n")
-
-	status := "Owners"
-	if !m.ownersDone {
-		status = fmt.Sprintf("Owners %s %d/%d", progressBar(len(m.ownerDays), len(m.fileDays)), len(m.ownerDays), len(m.fileDays))
-	} else if m.ownersErr != nil {
-		status = "Owners failed (" + m.ownersErr.Error() + ")"
+	title := m.repo + " — LOC over time"
+	if m.rangeDays != 0 {
+		title += " (" + rangeLabel(m.rangeDays) + ")"
 	}
-	m.renderLegend(&b, status, m.ownerSeries, m.ownerColors)
-	m.renderChart(&b, ownerSnaps(m.ownerDays), m.ownerSeries, m.ownerColors, m.barHeight())
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(title+"  ["+viewName(m.view)+"]") + "\n\n")
 
-	m.renderDetails(&b)
-	b.WriteString("\n←/→ select day · q quit\n")
+	visStart := m.visibleStart()
+	cursorRel := m.cursor - visStart
+
+	switch m.view {
+	case viewLangs:
+		m.renderLegend(&b, "By language", m.fileSeries, m.fileColors)
+		m.renderChart(&b, fileSnapsOf(m.fileDays[visStart:]), m.fileSeries, m.fileColors, m.chartBarHeight(), cursorRel)
+		m.renderDayBreakdown(&b, m.fileColors, m.fileDays[m.cursor].Types)
+
+	case viewOwners:
+		status := "By contributor"
+		if !m.ownersDone {
+			status = fmt.Sprintf("By contributor %s %d/%d", progressBar(len(m.ownerByDay), len(m.fileDays)), len(m.ownerByDay), len(m.fileDays))
+		} else if m.ownersErr != nil {
+			status = "Contributors failed (" + m.ownersErr.Error() + ")"
+		}
+		m.renderLegend(&b, status, m.ownerSeries, m.ownerColors)
+		m.renderChart(&b, m.ownerArrivedSnaps(visStart), m.ownerSeries, m.ownerColors, m.chartBarHeight(), m.ownerCursorRel(visStart))
+		if s, ok := m.ownerByDay[m.cursor]; ok {
+			m.renderDayBreakdown(&b, m.ownerColors, s.Users)
+		} else {
+			b.WriteString("\n" + fmt.Sprintf("%s  (contributors: computing… %d/%d)", m.fileDays[m.cursor].Date, len(m.ownerByDay), len(m.fileDays)) + "\n")
+		}
+
+	case viewLangTable:
+		// Cumulative counts, so the last day is the current all-time state.
+		m.renderTotalTable(&b, "By language", m.fileColors, m.fileDays[len(m.fileDays)-1].Types)
+
+	case viewOwnerTable:
+		if last, ok := m.ownerByDay[len(m.fileDays)-1]; ok {
+			if m.ownersDone && m.ownersErr != nil {
+				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Render("Some days failed to compute: "+m.ownersErr.Error()) + "\n\n")
+			}
+			m.renderTotalTable(&b, "By contributor", m.ownerColors, last.Users)
+		} else if !m.ownersDone {
+			b.WriteString(fmt.Sprintf("Contributors are still computing… (%d/%d)\n", len(m.ownerByDay), len(m.fileDays)))
+		} else {
+			b.WriteString("Owner computation failed: " + m.ownersErr.Error() + "\n")
+		}
+	}
+
+	b.WriteString("\n←/→ day · 1:1w 2:1m 3:3m 4:1y 5:all · tab view · q quit\n")
 	return tea.NewView(b.String())
 }
 
-// barHeight splits the available vertical space between the two charts.
-func (m chartModel) barHeight() int {
-	h := (m.height - 12) / 2
-	if h < 4 {
-		return 4
+// chartBarHeight sizes a single full-height chart.
+func (m chartModel) chartBarHeight() int {
+	h := m.height - 10
+	if h < 6 {
+		return 6
 	}
-	if h > 18 {
-		return 18
+	if h > 24 {
+		return 24
 	}
 	return h
 }
@@ -280,26 +400,31 @@ type cell struct {
 
 const dimIdx = -2
 
-// renderChart draws a line graph: one colored polyline per series with a dot
-// at each (sampled) day, y-axis tick labels on the left, faint horizontal
-// gridlines, and date labels centered under their dots.
-func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []string, colors map[string]color.Color, barH int) {
-	maxCols := m.width - 10 // leave room for the y-axis labels
-	if maxCols < 10 {
-		maxCols = 10
+// renderChart draws a line graph spanning the full plot width: one colored
+// polyline per series with a dot at each (sampled) day, y-axis tick labels on
+// the left, faint horizontal gridlines, and date labels centered under their
+// dots. Points are stretched across the whole width regardless of how many
+// days there are. cursor is an index into snaps (-1 selects nothing).
+func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []string, colors map[string]color.Color, barH, cursor int) {
+	plotW := m.width - 10 // leave room for the y-axis labels
+	if plotW < 10 {
+		plotW = 10
 	}
 	n := len(snaps)
 	if n == 0 {
 		b.WriteString("  (waiting for data…)\n")
 		return
 	}
+
+	// Sample so there is at most one point per column, then stretch the
+	// points across the full plot width.
 	step := 1
-	if n > maxCols {
-		step = (n + maxCols - 1) / maxCols
+	if n > plotW {
+		step = (n + plotW - 1) / plotW
 	}
-	cols := 0
+	points := 0
 	for i := 0; i < n; i += step {
-		cols++
+		points++
 	}
 
 	maxTotal := int64(1)
@@ -316,10 +441,16 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 	yPos := func(v int64) int {
 		return int(float64(v) / float64(maxTotal) * float64(barH-1))
 	}
+	xPos := func(k int) int {
+		if points == 1 {
+			return plotW / 2
+		}
+		return int(math.Round(float64(k) * float64(plotW-1) / float64(points-1)))
+	}
 
 	grid := make([][]cell, barH)
 	for r := range grid {
-		grid[r] = make([]cell, cols)
+		grid[r] = make([]cell, plotW)
 		for c := range grid[r] {
 			grid[r][c] = cell{r: ' ', c: -1}
 		}
@@ -336,30 +467,33 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 		if r == 0 {
 			ch = '-'
 		}
-		for c := 0; c < cols; c++ {
+		for c := 0; c < plotW; c++ {
 			grid[r][c] = cell{r: ch, c: dimIdx}
 		}
 	}
 
-	// Pass 1: line segments (later series overwrite earlier ones on overlap).
+	// Pass 1: line segments between consecutive points (later series
+	// overwrite earlier ones on overlap).
 	for si := range series {
 		name := series[si]
-		prevX, prevY := -1, 0
-		for c := 0; c < cols; c++ {
-			y := yPos(snaps[c*step].values[name])
+		prevX, prevY, k := -1, 0, 0
+		for i := 0; i < n; i += step {
+			x := xPos(k)
+			y := yPos(snaps[i].values[name])
 			if prevX >= 0 {
-				drawSegment(grid, prevX, prevY, c, y, si)
+				drawLine(grid, prevX, prevY, x, y, si)
 			}
-			prevX, prevY = c, y
+			prevX, prevY, k = x, y, k+1
 		}
 	}
 
 	// Pass 2: dots on top of the lines.
 	for si := range series {
 		name := series[si]
-		for c := 0; c < cols; c++ {
-			y := yPos(snaps[c*step].values[name])
-			grid[y][c] = cell{r: '•', c: si, dot: true}
+		k := 0
+		for i := 0; i < n; i += step {
+			grid[yPos(snaps[i].values[name])][xPos(k)] = cell{r: '•', c: si, dot: true}
+			k++
 		}
 	}
 
@@ -368,6 +502,12 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 		if len(l)+1 > margin {
 			margin = len(l) + 1
 		}
+	}
+
+	// The selected day snaps to the nearest drawn point.
+	selX := -1
+	if cursor >= 0 && cursor < n {
+		selX = xPos(cursor / step)
 	}
 
 	styles := make([]lipgloss.Style, len(series))
@@ -383,7 +523,7 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 		} else {
 			row.WriteString(strings.Repeat(" ", margin))
 		}
-		for c := 0; c < cols; c++ {
+		for c := 0; c < plotW; c++ {
 			cl := grid[r][c]
 			if cl.c == -1 {
 				row.WriteString(" ")
@@ -393,7 +533,7 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 			switch {
 			case cl.c == dimIdx:
 				st = dim
-			case cl.dot && c*step == m.cursor:
+			case cl.dot && c == selX:
 				st = styles[cl.c].Underline(true)
 			default:
 				st = styles[cl.c]
@@ -403,63 +543,66 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 		b.WriteString(row.String() + "\n")
 	}
 
-	// X axis: "MM-DD" labels centered under their dots, skipping any that
+	// X axis: "DD-MM" labels centered under their dots, skipping any that
 	// would overlap a previous label.
-	label := make([]string, cols)
+	label := make([]string, plotW)
 	for i := range label {
 		label[i] = " "
 	}
 	lastEnd := -1
-	for c := 0; c < cols; c++ {
-		s := snaps[c*step].date
+	k := 0
+	for i := 0; i < n; i += step {
+		s := snaps[i].date
 		if len(s) >= 5 {
 			s = s[:5] // "DD-MM-YYYY" -> "DD-MM"
 		}
-		start := c - len(s)/2
+		start := xPos(k) - len(s)/2
 		end := start + len(s)
-		if start < 0 || end > cols || start <= lastEnd {
-			continue
+		if start >= 0 && end <= plotW && start > lastEnd {
+			for j, ch := range s {
+				label[start+j] = string(ch)
+			}
+			lastEnd = end
 		}
-		for i, ch := range s {
-			label[start+i] = string(ch)
-		}
-		lastEnd = end
+		k++
 	}
 	b.WriteString(strings.Repeat(" ", margin) + strings.Join(label, "") + "\n")
 }
 
-// drawSegment connects (x0,y0) to the adjacent column x1 with a single slope
-// character: - flat, / rising, \ falling, | steep.
-func drawSegment(grid [][]cell, x0, y0, x1, y1, si int) {
-	dy := y1 - y0
-	var ch rune
-	switch {
-	case dy == 0:
-		ch = '-'
-	case dy > 0:
-		if dy >= 2 {
-			ch = '|'
-		} else {
-			ch = '/'
+// drawLine connects (x0,y0) to (x1,y1), x1 > x0, stepping one column at a
+// time with slope characters: - flat, / rising, \ falling, | steep.
+func drawLine(grid [][]cell, x0, y0, x1, y1, si int) {
+	prevY := y0
+	for x := x0 + 1; x <= x1; x++ {
+		t := float64(x-x0) / float64(x1-x0)
+		y := int(math.Round(float64(y0) + t*float64(y1-y0)))
+		dy := y - prevY
+		var ch rune
+		switch {
+		case dy == 0:
+			ch = '-'
+		case dy > 0:
+			if dy >= 2 {
+				ch = '|'
+			} else {
+				ch = '/'
+			}
+		default:
+			if dy <= -2 {
+				ch = '|'
+			} else {
+				ch = '\\'
+			}
 		}
-	default:
-		if dy <= -2 {
-			ch = '|'
-		} else {
-			ch = '\\'
+		r := y
+		if prevY < r {
+			r = prevY // sit on the lower cell of the step
 		}
+		if r >= 0 && r < len(grid) {
+			grid[r][x] = cell{r: ch, c: si}
+		}
+		prevY = y
 	}
-	r := y1
-	switch {
-	case dy > 0 && dy < 2:
-		r = y0 // "/" sits on the lower cell of a rising step
-	case dy < 0 && dy > -2:
-		r = y1 // "\" sits on the lower cell of a falling step
-	}
-	if r < 0 || r >= len(grid) {
-		return
-	}
-	grid[r][x1] = cell{r: ch, c: si}
 }
 
 // niceTicks returns ~count round tick values covering 0..max.
@@ -504,40 +647,79 @@ func formatTick(v int64) string {
 	}
 }
 
-// renderDetails shows the breakdown for the selected day: file types always,
-// owners once that day's snapshot has arrived.
-func (m chartModel) renderDetails(b *strings.Builder) {
-	d := m.fileDays[m.cursor]
+// seriesByValue lists the non-zero entries of values, largest first.
+func seriesByValue(values map[string]int64) []string {
+	names := make([]string, 0, len(values))
+	for n, v := range values {
+		if v > 0 {
+			names = append(names, n)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if values[names[i]] != values[names[j]] {
+			return values[names[i]] > values[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	return names
+}
+
+// renderDayBreakdown writes the per-series line counts for the selected day,
+// shown under a graph.
+func (m chartModel) renderDayBreakdown(b *strings.Builder, colors map[string]color.Color, values map[string]int64) {
 	var total int64
-	for _, v := range d.Types {
+	for _, v := range values {
 		total += v
 	}
 
-	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%s  (%d lines)", d.Date, total)) + "\n")
-
-	var files []string
-	for _, ext := range m.fileSeries {
-		if v, ok := d.Types[ext]; ok {
-			files = append(files, fmt.Sprintf("%s %d", lipgloss.NewStyle().Foreground(m.fileColors[ext]).Render("██"), v))
-		}
-	}
-	b.WriteString("  files:  " + strings.Join(files, "  ") + "\n")
-
-	if m.cursor < len(m.ownerDays) {
-		var owners []string
-		od := m.ownerDays[m.cursor]
-		for _, a := range m.ownerSeries {
-			if v, ok := od.Users[a]; ok {
-				owners = append(owners, fmt.Sprintf("%s %-20s %d", lipgloss.NewStyle().Foreground(m.ownerColors[a]).Render("██"), a, v))
-			}
-		}
-		b.WriteString("  owners: " + strings.Join(owners, "  ") + "\n")
-	} else {
-		b.WriteString("  owners: computing…\n")
+	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%s  (%d lines)", m.fileDays[m.cursor].Date, total)) + "\n")
+	for _, name := range seriesByValue(values) {
+		square := lipgloss.NewStyle().Foreground(colors[name]).Render("██")
+		b.WriteString(fmt.Sprintf("  %s %-24s %d\n", square, name, values[name]))
 	}
 }
 
-func fileSnaps(days []parser.DayStats) []dayValues {
+// renderTotalTable writes an all-time table of per-series line counts: name,
+// lines, and share of the total.
+func (m chartModel) renderTotalTable(b *strings.Builder, title string, colors map[string]color.Color, values map[string]int64) {
+	var total int64
+	for _, v := range values {
+		total += v
+	}
+
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(title+" — all time") + "\n\n")
+
+	names := seriesByValue(values)
+	if len(names) == 0 {
+		b.WriteString("  (no lines)\n")
+		return
+	}
+
+	nameW := 0
+	for _, n := range names {
+		if len(n) > nameW {
+			nameW = len(n)
+		}
+	}
+	if nameW > 28 {
+		nameW = 28
+	}
+
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	b.WriteString(dim.Render(fmt.Sprintf("   %-*s  %10s  %7s", nameW, "name", "lines", "share")) + "\n")
+	for _, n := range names {
+		v := values[n]
+		share := 0.0
+		if total > 0 {
+			share = float64(v) / float64(total) * 100
+		}
+		square := lipgloss.NewStyle().Foreground(colors[n]).Render("██ ")
+		b.WriteString(fmt.Sprintf("  %s%-*s  %10d  %6.1f%%\n", square, nameW, n, v, share))
+	}
+	b.WriteString(dim.Render(fmt.Sprintf("   %-*s  %10d", nameW, "total", total)) + "\n")
+}
+
+func fileSnapsOf(days []parser.DayStats) []dayValues {
 	out := make([]dayValues, len(days))
 	for i, d := range days {
 		out[i] = dayValues{date: d.Date, values: d.Types}
@@ -545,12 +727,31 @@ func fileSnaps(days []parser.DayStats) []dayValues {
 	return out
 }
 
-func ownerSnaps(days []parser.UserDayStats) []dayValues {
-	out := make([]dayValues, len(days))
-	for i, d := range days {
-		out[i] = dayValues{date: d.Date, values: d.Users}
+// ownerArrivedSnaps returns the arrived owner snapshots in chronological
+// order, restricted to the visible range (day index >= visStart).
+func (m chartModel) ownerArrivedSnaps(visStart int) []dayValues {
+	out := make([]dayValues, 0, len(m.ownerByDay))
+	for i := visStart; i < len(m.fileDays); i++ {
+		if s, ok := m.ownerByDay[i]; ok {
+			out = append(out, dayValues{date: s.Date, values: s.Users})
+		}
 	}
 	return out
+}
+
+// ownerCursorRel is the selected day's position among the arrived snapshots
+// (the x index renderChart expects), or -1 if that day has not arrived yet.
+func (m chartModel) ownerCursorRel(visStart int) int {
+	if _, ok := m.ownerByDay[m.cursor]; !ok {
+		return -1
+	}
+	pos := 0
+	for i := visStart; i < m.cursor; i++ {
+		if _, ok := m.ownerByDay[i]; ok {
+			pos++
+		}
+	}
+	return pos
 }
 
 func progressBar(done, total int) string {

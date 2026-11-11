@@ -76,7 +76,7 @@ func (m model) View() tea.View {
 }
 
 func main() {
-	repos := parser.GetGitDirPaths("~/Documents/GitHub")
+	repos := parser.GetGitDirPaths("~/Documents")
 
 	p := tea.NewProgram(initialModel(repos))
 	finalModel, err := p.Run()
