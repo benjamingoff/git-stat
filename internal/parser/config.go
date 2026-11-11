@@ -6,9 +6,7 @@ import (
 	"path/filepath"
 )
 
-// ConfigFileName is the optional per-repo configuration file, read from the
-// repo root when present. A missing file means defaults: all languages and
-// .gitignore-only exclusions.
+// ConfigFileName is the optional per-repo config file at the repo root; a missing file means defaults.
 const ConfigFileName = ".gitstatconfig"
 
 // Config controls which files git-stat counts for a repo.
@@ -21,9 +19,8 @@ type Config struct {
 	ExcludeDirs []string `json:"exclude_dirs"`
 }
 
-// LoadConfig creates a Config for repo: if ConfigFileName exists at the repo
-// root it is parsed, otherwise the defaults are returned (all languages,
-// .gitignore-only exclusions). An invalid file also falls back to defaults.
+// LoadConfig parses ConfigFileName from the repo root, falling back to defaults
+// (all languages, .gitignore-only exclusions) if it is missing or invalid.
 func LoadConfig(repo string) *Config {
 	cfg := &Config{}
 	data, err := os.ReadFile(filepath.Join(repo, ConfigFileName))

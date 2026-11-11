@@ -19,7 +19,6 @@ var palette = []color.Color{
 	lipgloss.Color("51"), lipgloss.Color("171"), lipgloss.Color("208"), lipgloss.Color("114"),
 }
 
-// dayValues is one chart column: a date plus per-series line counts.
 type dayValues struct {
 	date   string
 	values map[string]int64
@@ -37,9 +36,8 @@ type ownerTick struct {
 
 type ownersDoneMsg struct{ err error }
 
-// ownerRun carries the in-flight background owner computation between Cmds.
-// The producer writes err and then closes ch; consumers read err only after
-// observing the close, so the channel is the only synchronization needed.
+// ownerRun carries the in-flight background owner computation between Cmds;
+// the channel close is the only synchronization (err is read only after it).
 type ownerRun struct {
 	ch  chan ownerTick
 	err error
@@ -99,7 +97,6 @@ func (m chartModel) Init() tea.Cmd {
 	return m.loadFiles()
 }
 
-// loadFiles computes the fast file-type timeline in a background Cmd.
 func (m chartModel) loadFiles() tea.Cmd {
 	return func() tea.Msg {
 		days, err := parser.LocOverTime(m.repo, m.filter)
@@ -107,8 +104,6 @@ func (m chartModel) loadFiles() tea.Cmd {
 	}
 }
 
-// startOwners kicks off the slow per-owner blame walk in the background and
-// returns a Cmd that delivers the first day snapshot.
 func (m *chartModel) startOwners() tea.Cmd {
 	run := &ownerRun{ch: make(chan ownerTick, 64)}
 	m.owner = run
@@ -122,8 +117,7 @@ func (m *chartModel) startOwners() tea.Cmd {
 	return m.nextOwnerTick()
 }
 
-// nextOwnerTick returns a Cmd that blocks until the next day snapshot (or the
-// completion message once the channel is closed).
+// nextOwnerTick returns a Cmd that blocks until the next day snapshot, or the completion message once done.
 func (m *chartModel) nextOwnerTick() tea.Cmd {
 	if m.owner == nil {
 		return nil
@@ -202,7 +196,6 @@ func (m chartModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// setRange switches the visible time window and keeps the cursor inside it.
 func (m *chartModel) setRange(days int) {
 	m.rangeDays = days
 	if s := m.visibleStart(); m.cursor < s {
@@ -210,8 +203,7 @@ func (m *chartModel) setRange(days int) {
 	}
 }
 
-// visibleStart is the index of the first day within the current range,
-// anchored at the last active day (not today, so stale repos still show data).
+// visibleStart is the index of the first day in the current range; it anchors at the last active day, not today.
 func (m chartModel) visibleStart() int {
 	if m.rangeDays == 0 || len(m.fileDays) == 0 {
 		return 0
@@ -248,7 +240,6 @@ func rangeLabel(days int) string {
 	}
 }
 
-// buildFileSeries orders file types by total lines and assigns colors.
 func (m *chartModel) buildFileSeries() {
 	totals := map[string]int64{}
 	for _, d := range m.fileDays {
@@ -260,8 +251,7 @@ func (m *chartModel) buildFileSeries() {
 	m.fileColors = colorsFor(m.fileSeries)
 }
 
-// buildOwnerSeries orders authors by lines owned so far and assigns each a
-// stable color on first sight, so colors don't shuffle as data streams in.
+// buildOwnerSeries orders authors by lines owned; colors are assigned on first sight so they don't shuffle as data streams in.
 func (m *chartModel) buildOwnerSeries() {
 	totals := map[string]int64{}
 	for _, d := range m.ownerByDay {
@@ -366,7 +356,6 @@ func (m chartModel) View() tea.View {
 	return tea.NewView(b.String())
 }
 
-// chartBarHeight sizes a single full-height chart.
 func (m chartModel) chartBarHeight() int {
 	h := m.height - 10
 	if h < 6 {
@@ -378,7 +367,6 @@ func (m chartModel) chartBarHeight() int {
 	return h
 }
 
-// renderLegend writes a "Title  ██ series  ██ series" line.
 func (m chartModel) renderLegend(b *strings.Builder, title string, series []string, colors map[string]color.Color) {
 	line := lipgloss.NewStyle().Bold(true).Render(title)
 	if len(series) > 0 {
@@ -391,7 +379,6 @@ func (m chartModel) renderLegend(b *strings.Builder, title string, series []stri
 	b.WriteString(line + "\n")
 }
 
-// cell is one character of the plot grid.
 type cell struct {
 	r   rune
 	c   int // series index; -1 empty, dimIdx for gridlines
@@ -400,11 +387,8 @@ type cell struct {
 
 const dimIdx = -2
 
-// renderChart draws a line graph spanning the full plot width: one colored
-// polyline per series with a dot at each (sampled) day, y-axis tick labels on
-// the left, faint horizontal gridlines, and date labels centered under their
-// dots. Points are stretched across the whole width regardless of how many
-// days there are. cursor is an index into snaps (-1 selects nothing).
+// renderChart draws one polyline per series stretched across the full plot width;
+// cursor is an index into snaps (-1 selects nothing).
 func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []string, colors map[string]color.Color, barH, cursor int) {
 	plotW := m.width - 10 // leave room for the y-axis labels
 	if plotW < 10 {
@@ -487,7 +471,6 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 		}
 	}
 
-	// Pass 2: dots on top of the lines.
 	for si := range series {
 		name := series[si]
 		k := 0
@@ -543,8 +526,6 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 		b.WriteString(row.String() + "\n")
 	}
 
-	// X axis: "DD-MM" labels centered under their dots, skipping any that
-	// would overlap a previous label.
 	label := make([]string, plotW)
 	for i := range label {
 		label[i] = " "
@@ -605,7 +586,6 @@ func drawLine(grid [][]cell, x0, y0, x1, y1, si int) {
 	}
 }
 
-// niceTicks returns ~count round tick values covering 0..max.
 func niceTicks(max int64, count int) []int64 {
 	if max <= 0 || count < 2 {
 		return []int64{0}
@@ -647,7 +627,6 @@ func formatTick(v int64) string {
 	}
 }
 
-// seriesByValue lists the non-zero entries of values, largest first.
 func seriesByValue(values map[string]int64) []string {
 	names := make([]string, 0, len(values))
 	for n, v := range values {
@@ -664,8 +643,6 @@ func seriesByValue(values map[string]int64) []string {
 	return names
 }
 
-// renderDayBreakdown writes the per-series line counts for the selected day,
-// shown under a graph.
 func (m chartModel) renderDayBreakdown(b *strings.Builder, colors map[string]color.Color, values map[string]int64) {
 	var total int64
 	for _, v := range values {
@@ -679,8 +656,6 @@ func (m chartModel) renderDayBreakdown(b *strings.Builder, colors map[string]col
 	}
 }
 
-// renderTotalTable writes an all-time table of per-series line counts: name,
-// lines, and share of the total.
 func (m chartModel) renderTotalTable(b *strings.Builder, title string, colors map[string]color.Color, values map[string]int64) {
 	var total int64
 	for _, v := range values {
@@ -727,8 +702,6 @@ func fileSnapsOf(days []parser.DayStats) []dayValues {
 	return out
 }
 
-// ownerArrivedSnaps returns the arrived owner snapshots in chronological
-// order, restricted to the visible range (day index >= visStart).
 func (m chartModel) ownerArrivedSnaps(visStart int) []dayValues {
 	out := make([]dayValues, 0, len(m.ownerByDay))
 	for i := visStart; i < len(m.fileDays); i++ {
@@ -739,8 +712,7 @@ func (m chartModel) ownerArrivedSnaps(visStart int) []dayValues {
 	return out
 }
 
-// ownerCursorRel is the selected day's position among the arrived snapshots
-// (the x index renderChart expects), or -1 if that day has not arrived yet.
+// ownerCursorRel is the x index of the selected day among arrived snapshots, or -1 if it has not arrived yet.
 func (m chartModel) ownerCursorRel(visStart int) int {
 	if _, ok := m.ownerByDay[m.cursor]; !ok {
 		return -1

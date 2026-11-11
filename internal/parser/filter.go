@@ -25,14 +25,11 @@ func NewFilter(repo string, cfg *Config) *Filter {
 	return f
 }
 
-// MarkPaths resolves ignore status for the given paths in one batched git
-// call (paths already resolved are skipped). Safe for concurrent use.
+// MarkPaths resolves ignore status for the given paths; safe for concurrent use.
 func (f *Filter) MarkPaths(paths []string) {
 	f.checker.Mark(paths)
 }
 
-// Included reports whether path counts: its language is allowed, it is not
-// under an excluded dir, and it is not ignored by the repo's .gitignore files.
 func (f *Filter) Included(path string) bool {
 	if len(f.types) > 0 && !f.types[extOf(path)] {
 		return false

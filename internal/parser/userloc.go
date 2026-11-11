@@ -23,14 +23,10 @@ func UserLocOverTime(repo string, filter *Filter) ([]UserDayStats, error) {
 	return userLocOverTime(repo, filter, nil)
 }
 
-// UserLocOverTimeProgress behaves like UserLocOverTime but calls onDay with
-// each snapshot as soon as it is ready (in completion order, not
-// chronological), so callers can render progress live. done and total count
-// days completed and expected; idx is the snapshot's position in the final
-// chronological slice. The most recent day — what all-time summaries need —
-// is blamed up front and delivered first; the remaining days stream in as
-// their workers finish (older days tend to finish sooner, having less
-// history to trace).
+// UserLocOverTimeProgress behaves like UserLocOverTime but calls onDay with each
+// snapshot as soon as it is ready (completion order); idx is the snapshot's
+// position in the returned chronological slice. The most recent day is blamed
+// up front so it arrives first.
 func UserLocOverTimeProgress(repo string, filter *Filter, onDay func(done int, total int, idx int, stats UserDayStats)) ([]UserDayStats, error) {
 	return userLocOverTime(repo, filter, onDay)
 }
@@ -54,10 +50,7 @@ func userLocOverTime(repo string, filter *Filter, onDay func(int, int, int, User
 	sort.Strings(days)
 	total := len(days)
 
-	// Blame the most recent day up front so callers streaming progress get
-	// the all-time snapshot first, before the fan-out below starts. (Older
-	// days are cheaper to blame, so queue order alone would not guarantee
-	// this one arrives first.)
+	// Blame the most recent day up front so progress callers get the all-time snapshot first.
 	out := make([]UserDayStats, total)
 	firstErr := error(nil)
 	doneCount := 0
@@ -74,12 +67,6 @@ func userLocOverTime(repo string, filter *Filter, onDay func(int, int, int, User
 		}
 	}
 
-	// Fan the remaining days out to one worker per logical CPU. Workers are
-	// mostly blocked waiting on `git blame` subprocesses, so more workers than
-	// cores is possible (blocked goroutines are cheap) — but measured on real
-	// repos it just adds disk/RAM contention without speeding things up. The
-	// results channel is buffered for everything in flight, so workers never
-	// block on us.
 	results := make(chan dayResult, total)
 	work := make(chan int, total)
 	for i := total - 2; i >= 0; i-- {
@@ -107,16 +94,12 @@ func userLocOverTime(repo string, filter *Filter, onDay func(int, int, int, User
 		}()
 	}
 
-	// Close results once the workers finish, without blocking emission: the
-	// loop below runs concurrently with them so snapshots stream out while
-	// other days are still being blamed.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Forward each snapshot to onDay in completion order; callers place it at
-	// its idx. The returned slice is chronological (indexed by day).
+	// onDay receives snapshots in completion order; the returned slice is chronological.
 	for res := range results {
 		doneCount++
 		if res.err != nil {
@@ -154,10 +137,6 @@ func lastCommitPerDay(repo string) (map[string]string, error) {
 	return byDay, nil
 }
 
-// blameAuthorsAt counts the lines owned by each author at commit, considering
-// only files the filter includes. git blame accepts a single file per
-// invocation, so this runs one blame per file and skips any that cannot be
-// blamed (e.g. binaries).
 func blameAuthorsAt(repo, commit string, filter *Filter) (map[string]int64, error) {
 	files, err := trackedFilesAt(repo, commit, filter)
 	if err != nil {
@@ -181,8 +160,6 @@ func addUserCounts(dst, src map[string]int64) {
 	}
 }
 
-// trackedFilesAt lists the files present at commit that the filter includes.
-// Ignore status is resolved in batches and cached across days by the filter.
 func trackedFilesAt(repo, commit string, filter *Filter) ([]string, error) {
 	cmd := exec.Command("git", "-C", repo, "ls-tree", "-r", "-z", "--name-only", commit)
 	out, err := cmd.Output()
@@ -208,8 +185,6 @@ func trackedFilesAt(repo, commit string, filter *Filter) ([]string, error) {
 	return included, nil
 }
 
-// blameFile runs `git blame --porcelain` on path at commit and returns
-// per-author line counts.
 func blameFile(repo, commit, path string) (map[string]int64, error) {
 	cmd := exec.Command("git", "-C", repo, "blame", "--porcelain", commit, "--", path)
 	stdout, err := cmd.StdoutPipe()
@@ -220,11 +195,8 @@ func blameFile(repo, commit, path string) (map[string]int64, error) {
 		return nil, err
 	}
 
-	// Every line of the files appears exactly once as a tab-prefixed content
-	// line. A record's header (including its author) is emitted only for the
-	// first line of a run of consecutive lines from the same commit; later
-	// lines in the run repeat just the record start, so the last seen author
-	// stays valid across them.
+	// A record's author header is emitted only for the first line of a run from
+	// the same commit, so the last seen author stays valid across later lines.
 	users := map[string]int64{}
 	current := ""
 	scanner := bufio.NewScanner(stdout)

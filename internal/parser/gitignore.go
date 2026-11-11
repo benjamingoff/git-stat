@@ -7,10 +7,9 @@ import (
 	"sync"
 )
 
-// IgnoreChecker resolves which paths a repo's .gitignore files exclude, using
-// `git check-ignore` so git's own pattern semantics apply (nested .gitignore
-// files, negations, etc.). Results are cached; paths are checked in batches
-// as they are first seen.
+// IgnoreChecker resolves which paths a repo's .gitignore files exclude via
+// `git check-ignore`, so git's own pattern semantics apply. Results are cached
+// and checked in batches as paths are first seen.
 type IgnoreChecker struct {
 	mu    sync.Mutex
 	repo  string
@@ -21,8 +20,6 @@ func NewIgnoreChecker(repo string) *IgnoreChecker {
 	return &IgnoreChecker{repo: repo, known: map[string]bool{}}
 }
 
-// Mark checks the given paths against the repo's ignore rules and records the
-// results. Paths not yet resolved are batched into a single git call.
 func (c *IgnoreChecker) Mark(paths []string) {
 	c.mu.Lock()
 	var todo []string
