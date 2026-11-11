@@ -87,7 +87,7 @@ func (m chartModel) loadFiles() tea.Cmd {
 
 // startOwners kicks off the slow per-owner blame walk in the background and
 // returns a Cmd that delivers the first day snapshot.
-func (m chartModel) startOwners() tea.Cmd {
+func (m *chartModel) startOwners() tea.Cmd {
 	run := &ownerRun{ch: make(chan ownerTick, 64)}
 	m.owner = run
 	go func() {
@@ -102,7 +102,7 @@ func (m chartModel) startOwners() tea.Cmd {
 
 // nextOwnerTick returns a Cmd that blocks until the next day snapshot (or the
 // completion message once the channel is closed).
-func (m chartModel) nextOwnerTick() tea.Cmd {
+func (m *chartModel) nextOwnerTick() tea.Cmd {
 	if m.owner == nil {
 		return nil
 	}
