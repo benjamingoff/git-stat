@@ -1,33 +1,23 @@
 package parser
 
 import (
-	"bufio"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-// DayStats holds the cumulative line count per file type at the end of a day
-// on which at least one commit was made.
+// DayStats holds cumulative line counts per file type at the end of a day that had commits.
 type DayStats struct {
 	Date  string // "DD-MM-YYYY"
 	Types map[string]int64
 }
 
-// LocOverTime walks a repo's mainline history (oldest to newest) in a single
-// `git log --numstat` pass, accumulating per-file line counts from each
-// commit's diff instead of re-counting the tree at every commit.
-//
-// The walk uses --first-parent so merge commits contribute the net diff they
-// brought into the mainline; that keeps the accumulated state at each commit
-// exactly equal to that commit's tree (summing diffs across side branches
-// instead would double-count overlapping changes).
-//
-// It returns one snapshot per day that had at least one mainline commit, in
-// chronological order. Only extensions present in includeTypes are counted.
-func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) {
+// LocOverTime accumulates per-file line counts from a single `git log --numstat`
+// pass over mainline history, returning one snapshot per active day in
+// chronological order. --first-parent limits merge commits to the net diff they
+// brought into the mainline, so each snapshot equals that commit's tree.
+func LocOverTime(repo string, filter *Filter) ([]DayStats, error) {
 	args := []string{
 		"-C", repo, "log",
 		"--first-parent", "--diff-merges=first-parent",
@@ -35,29 +25,48 @@ func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) 
 		"--date=short", "--format=C%H|%ad",
 	}
 	cmd := exec.Command("git", args...)
-	stdout, err := cmd.StdoutPipe()
+	raw, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
 
-	scanner := bufio.NewScanner(stdout)
+	lines := strings.Split(string(raw), "\n")
+
+	pathSet := map[string]bool{}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "C") {
+			continue
+		}
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		if strings.Contains(fields[2], " => ") {
+			oldPath, newPath := parseRename(fields[2])
+			pathSet[oldPath] = true
+			pathSet[newPath] = true
+		} else {
+			pathSet[fields[2]] = true
+		}
+	}
+	paths := make([]string, 0, len(pathSet))
+	for p := range pathSet {
+		paths = append(paths, p)
+	}
+	filter.MarkPaths(paths)
+
 	fileLines := map[string]int64{}       // path -> current line count
 	days := map[string]map[string]int64{} // "YYYY-MM-DD" -> end-of-day snapshot
 
-	// flushDay records the running totals as the end-of-day state. It is
-	// called once per commit, so the last commit of a day overwrites earlier
-	// ones and wins.
+	// Called once per commit, so the last commit of a day wins.
 	flushDay := func(day string) {
 		if day == "" {
 			return
 		}
 		snap := map[string]int64{}
 		for path, n := range fileLines {
-			if ext := extOf(path); includeTypes[ext] {
-				snap[ext] += n
+			if filter.Included(path) {
+				snap[extOf(path)] += n
 			}
 		}
 		for ext, n := range snap {
@@ -77,11 +86,8 @@ func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) 
 	}
 
 	currentDay := ""
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Commit marker line: "C<sha>|<YYYY-MM-DD>". Numstat lines always
-		// start with a digit or '-', so a leading 'C' is unambiguous.
+	for _, line := range lines {
+		// "C<sha>|<date>" marker; numstat lines start with a digit or '-', so 'C' is unambiguous.
 		if strings.HasPrefix(line, "C") {
 			if i := strings.Index(line, "|"); i >= 0 {
 				flushDay(currentDay)
@@ -92,7 +98,7 @@ func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) 
 
 		fields := strings.SplitN(line, "\t", 3)
 		if len(fields) != 3 {
-			continue // blank line or anything unexpected
+			continue
 		}
 		addedS, removedS, path := fields[0], fields[1], fields[2]
 		if addedS == "-" || removedS == "-" {
@@ -108,9 +114,7 @@ func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) 
 		}
 
 		if strings.Contains(path, " => ") {
-			// Rename: carry the file's whole line count from the old path to
-			// the new one, then apply the delta. This stays accurate for
-			// renames that change the extension too.
+			// Rename: carry the old path's line count to the new one, then apply the delta.
 			oldPath, newPath := parseRename(path)
 			oldLines := fileLines[oldPath]
 			delete(fileLines, oldPath)
@@ -122,13 +126,6 @@ func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) 
 		bump(path, added-removed)
 	}
 	flushDay(currentDay)
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, err
-	}
 
 	// "YYYY-MM-DD" keys sort chronologically as plain strings.
 	isos := make([]string, 0, len(days))
@@ -144,11 +141,8 @@ func LocOverTime(repo string, includeTypes map[string]bool) ([]DayStats, error) 
 	return out, nil
 }
 
-// parseRename expands git's rename notation "prefix{old => new}suffix" (or
-// "old => new" when there is no shared part) into the full old and new
-// paths. When one side of the rename is empty (a file moved into or out of a
-// subdirectory), the shared prefix and suffix glue together with a doubled
-// slash, which is normalized away.
+// parseRename expands git's "prefix{old => new}suffix" rename notation into full
+// old and new paths, normalizing the doubled slash that appears when one side is empty.
 func parseRename(path string) (oldPath, newPath string) {
 	bopen := strings.Index(path, "{")
 	bclose := strings.LastIndex(path, "}")
@@ -168,17 +162,4 @@ func normPath(p string) string {
 		p = strings.ReplaceAll(p, "//", "/")
 	}
 	return p
-}
-
-func extOf(path string) string {
-	return strings.TrimPrefix(filepath.Ext(path), ".")
-}
-
-// flipDate converts "YYYY-MM-DD" to "DD-MM-YYYY".
-func flipDate(iso string) string {
-	parts := strings.Split(iso, "-")
-	if len(parts) != 3 {
-		return iso
-	}
-	return parts[2] + "-" + parts[1] + "-" + parts[0]
 }

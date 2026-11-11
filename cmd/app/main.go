@@ -89,9 +89,10 @@ func main() {
 		return
 	}
 
-	explicitFileTypes := map[string]bool{"go": true, "ts": true, "tsx": true, "py": true}
+	cfg := parser.LoadConfig(m.selected)
+	filter := parser.NewFilter(m.selected, cfg)
 
-	p = tea.NewProgram(newChartModel(m.selected, explicitFileTypes))
+	p = tea.NewProgram(newChartModel(m.selected, filter))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to run chart for %s: %v\n", m.selected, err)
 		os.Exit(1)

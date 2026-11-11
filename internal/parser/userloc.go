@@ -9,26 +9,18 @@ import (
 	"sync"
 )
 
-// UserDayStats holds the per-user line ownership at the end of a day on
-// which at least one commit was made.
+// UserDayStats holds per-user line ownership at the end of a day that had commits.
 type UserDayStats struct {
 	Date  string // "DD-MM-YYYY"
 	Users map[string]int64
 }
 
-// UserLocOverTime reports, for each day that had at least one mainline
-// commit, how many lines of the included file types were owned by each
-// author as of that day's last commit. Ownership means "last commit to
-// touch this line".
-//
-// Unlike LocOverTime (which accumulates diffs in a single pass), ownership
-// cannot be updated incrementally: every snapshot needs a full `git blame`
-// at that day's final commit, tracing each line back through history until
-// its introducing commit is found. The days are independent, so they are
-// blamed concurrently across runtime.NumCPU() workers; results are still
-// returned in chronological order.
-func UserLocOverTime(repo string, includeTypes map[string]bool) ([]UserDayStats, error) {
-	return userLocOverTime(repo, includeTypes, nil)
+// UserLocOverTime reports, for each active day, how many lines of the included
+// files each author owned as of that day's last commit (ownership = last commit
+// to touch the line). Each snapshot needs a full `git blame`, so days are blamed
+// concurrently and returned in chronological order.
+func UserLocOverTime(repo string, filter *Filter) ([]UserDayStats, error) {
+	return userLocOverTime(repo, filter, nil)
 }
 
 // UserLocOverTimeProgress behaves like UserLocOverTime but calls onDay with
@@ -39,8 +31,8 @@ func UserLocOverTime(repo string, includeTypes map[string]bool) ([]UserDayStats,
 // is blamed up front and delivered first; the remaining days stream in as
 // their workers finish (older days tend to finish sooner, having less
 // history to trace).
-func UserLocOverTimeProgress(repo string, includeTypes map[string]bool, onDay func(done int, total int, idx int, stats UserDayStats)) ([]UserDayStats, error) {
-	return userLocOverTime(repo, includeTypes, onDay)
+func UserLocOverTimeProgress(repo string, filter *Filter, onDay func(done int, total int, idx int, stats UserDayStats)) ([]UserDayStats, error) {
+	return userLocOverTime(repo, filter, onDay)
 }
 
 type dayResult struct {
@@ -49,7 +41,7 @@ type dayResult struct {
 	err  error
 }
 
-func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, int, int, UserDayStats)) ([]UserDayStats, error) {
+func userLocOverTime(repo string, filter *Filter, onDay func(int, int, int, UserDayStats)) ([]UserDayStats, error) {
 	commitsByDay, err := lastCommitPerDay(repo)
 	if err != nil {
 		return nil, err
@@ -71,7 +63,7 @@ func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, 
 	doneCount := 0
 	if total > 0 {
 		doneCount = 1
-		users, err := blameAuthorsAt(repo, commitsByDay[days[total-1]], includeTypes)
+		users, err := blameAuthorsAt(repo, commitsByDay[days[total-1]], filter)
 		if err != nil {
 			firstErr = err
 		} else {
@@ -105,7 +97,7 @@ func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, 
 		go func() {
 			defer wg.Done()
 			for idx := range work {
-				users, err := blameAuthorsAt(repo, commitsByDay[days[idx]], includeTypes)
+				users, err := blameAuthorsAt(repo, commitsByDay[days[idx]], filter)
 				if err != nil {
 					results <- dayResult{idx: idx, err: err}
 					return
@@ -163,11 +155,11 @@ func lastCommitPerDay(repo string) (map[string]string, error) {
 }
 
 // blameAuthorsAt counts the lines owned by each author at commit, considering
-// only files whose extension is in includeTypes. git blame accepts a single
-// file per invocation, so this runs one blame per file and skips any that
-// cannot be blamed (e.g. binaries).
-func blameAuthorsAt(repo, commit string, includeTypes map[string]bool) (map[string]int64, error) {
-	files, err := trackedFilesAt(repo, commit, includeTypes)
+// only files the filter includes. git blame accepts a single file per
+// invocation, so this runs one blame per file and skips any that cannot be
+// blamed (e.g. binaries).
+func blameAuthorsAt(repo, commit string, filter *Filter) (map[string]int64, error) {
+	files, err := trackedFilesAt(repo, commit, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -189,9 +181,9 @@ func addUserCounts(dst, src map[string]int64) {
 	}
 }
 
-// trackedFilesAt lists the files present at commit whose extension is in
-// includeTypes.
-func trackedFilesAt(repo, commit string, includeTypes map[string]bool) ([]string, error) {
+// trackedFilesAt lists the files present at commit that the filter includes.
+// Ignore status is resolved in batches and cached across days by the filter.
+func trackedFilesAt(repo, commit string, filter *Filter) ([]string, error) {
 	cmd := exec.Command("git", "-C", repo, "ls-tree", "-r", "-z", "--name-only", commit)
 	out, err := cmd.Output()
 	if err != nil {
@@ -203,11 +195,17 @@ func trackedFilesAt(repo, commit string, includeTypes map[string]bool) ([]string
 		if path == "" {
 			continue
 		}
-		if includeTypes[extOf(path)] {
-			files = append(files, path)
+		files = append(files, path)
+	}
+	filter.MarkPaths(files)
+
+	var included []string
+	for _, p := range files {
+		if filter.Included(p) {
+			included = append(included, p)
 		}
 	}
-	return files, nil
+	return included, nil
 }
 
 // blameFile runs `git blame --porcelain` on path at commit and returns

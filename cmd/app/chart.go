@@ -66,8 +66,8 @@ func viewName(v int) string {
 }
 
 type chartModel struct {
-	repo         string
-	includeTypes map[string]bool
+	repo   string
+	filter *parser.Filter
 
 	fileDays   []parser.DayStats           // fast single-pass stats; ready first
 	ownerByDay map[int]parser.UserDayStats // day index -> snapshot; arrives out of order (newest first)
@@ -91,8 +91,8 @@ type chartModel struct {
 	ownersErr   error
 }
 
-func newChartModel(repo string, includeTypes map[string]bool) chartModel {
-	return chartModel{repo: repo, includeTypes: includeTypes, width: 80, height: 24}
+func newChartModel(repo string, filter *parser.Filter) chartModel {
+	return chartModel{repo: repo, filter: filter, width: 80, height: 24}
 }
 
 func (m chartModel) Init() tea.Cmd {
@@ -102,7 +102,7 @@ func (m chartModel) Init() tea.Cmd {
 // loadFiles computes the fast file-type timeline in a background Cmd.
 func (m chartModel) loadFiles() tea.Cmd {
 	return func() tea.Msg {
-		days, err := parser.LocOverTime(m.repo, m.includeTypes)
+		days, err := parser.LocOverTime(m.repo, m.filter)
 		return filesLoadedMsg{days: days, err: err}
 	}
 }
@@ -113,7 +113,7 @@ func (m *chartModel) startOwners() tea.Cmd {
 	run := &ownerRun{ch: make(chan ownerTick, 64)}
 	m.owner = run
 	go func() {
-		_, err := parser.UserLocOverTimeProgress(m.repo, m.includeTypes, func(done, total int, idx int, s parser.UserDayStats) {
+		_, err := parser.UserLocOverTimeProgress(m.repo, m.filter, func(done, total int, idx int, s parser.UserDayStats) {
 			run.ch <- ownerTick{idx: idx, stats: s}
 		})
 		run.err = err
