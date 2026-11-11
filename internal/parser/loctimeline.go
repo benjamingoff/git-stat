@@ -12,7 +12,7 @@ import (
 // DayStats holds the cumulative line count per file type at the end of a day
 // on which at least one commit was made.
 type DayStats struct {
-	Date  string // "MM-DD-YYYY"
+	Date  string // "DD-MM-YYYY"
 	Types map[string]int64
 }
 
@@ -174,7 +174,7 @@ func extOf(path string) string {
 	return strings.TrimPrefix(filepath.Ext(path), ".")
 }
 
-// flipDate converts "YYYY-MM-DD" to "MM-DD-YYYY".
+// flipDate converts "YYYY-MM-DD" to "DD-MM-YYYY".
 func flipDate(iso string) string {
 	parts := strings.Split(iso, "-")
 	if len(parts) != 3 {

@@ -3,14 +3,16 @@ package parser
 import (
 	"bufio"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // UserDayStats holds the per-user line ownership at the end of a day on
 // which at least one commit was made.
 type UserDayStats struct {
-	Date  string // "MM-DD-YYYY"
+	Date  string // "DD-MM-YYYY"
 	Users map[string]int64
 }
 
@@ -22,9 +24,27 @@ type UserDayStats struct {
 // Unlike LocOverTime (which accumulates diffs in a single pass), ownership
 // cannot be updated incrementally: every snapshot needs a full `git blame`
 // at that day's final commit, tracing each line back through history until
-// its introducing commit is found. This is O(days x blame cost) and can be
-// slow on large repos.
+// its introducing commit is found. The days are independent, so they are
+// blamed concurrently across runtime.NumCPU() workers; results are still
+// returned in chronological order.
 func UserLocOverTime(repo string, includeTypes map[string]bool) ([]UserDayStats, error) {
+	return userLocOverTime(repo, includeTypes, nil)
+}
+
+// UserLocOverTimeProgress behaves like UserLocOverTime but calls onDay with
+// each snapshot as soon as it is ready (in chronological order), so callers
+// can render progress live. done and total count days completed and expected.
+func UserLocOverTimeProgress(repo string, includeTypes map[string]bool, onDay func(done int, total int, stats UserDayStats)) ([]UserDayStats, error) {
+	return userLocOverTime(repo, includeTypes, onDay)
+}
+
+type dayResult struct {
+	idx  int
+	snap UserDayStats
+	err  error
+}
+
+func userLocOverTime(repo string, includeTypes map[string]bool, onDay func(int, int, UserDayStats)) ([]UserDayStats, error) {
 	commitsByDay, err := lastCommitPerDay(repo)
 	if err != nil {
 		return nil, err
@@ -35,16 +55,69 @@ func UserLocOverTime(repo string, includeTypes map[string]bool) ([]UserDayStats,
 		days = append(days, day)
 	}
 	sort.Strings(days)
+	total := len(days)
 
-	out := make([]UserDayStats, 0, len(days))
-	for _, day := range days {
-		users, err := blameAuthorsAt(repo, commitsByDay[day], includeTypes)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, UserDayStats{Date: flipDate(day), Users: users})
+	// Fan the days out to one worker per CPU core. The results channel is
+	// buffered for everything in flight, so workers never block on us.
+	results := make(chan dayResult, total)
+	work := make(chan int, total)
+	for i := range days {
+		work <- i
 	}
-	return out, nil
+	close(work)
+
+	workers := runtime.NumCPU()
+	if workers > total {
+		workers = total
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range work {
+				users, err := blameAuthorsAt(repo, commitsByDay[days[idx]], includeTypes)
+				if err != nil {
+					results <- dayResult{idx: idx, err: err}
+					return
+				}
+				results <- dayResult{idx: idx, snap: UserDayStats{Date: flipDate(days[idx]), Users: users}}
+			}
+		}()
+	}
+
+	// Close results once the workers finish, without blocking emission: the
+	// reassembly below runs concurrently with them so snapshots stream out
+	// while later days are still being blamed.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Reassemble in chronological order, emitting each snapshot to onDay as
+	// soon as its turn comes (later days may already be done and waiting).
+	out := make([]UserDayStats, 0, total)
+	pending := map[int]dayResult{}
+	nextIdx, firstErr := 0, error(nil)
+	for res := range results {
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+		}
+		pending[res.idx] = res
+		for {
+			r, ok := pending[nextIdx]
+			if !ok {
+				break
+			}
+			delete(pending, nextIdx)
+			out = append(out, r.snap)
+			if onDay != nil {
+				onDay(nextIdx+1, total, r.snap)
+			}
+			nextIdx++
+		}
+	}
+	return out, firstErr
 }
 
 // lastCommitPerDay returns the sha of the last first-parent commit for each

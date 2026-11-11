@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -91,27 +90,10 @@ func main() {
 	}
 
 	explicitFileTypes := map[string]bool{"go": true, "ts": true, "tsx": true, "py": true}
-	days, err := parser.LocOverTime(m.selected, explicitFileTypes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to compute LOC timeline for %s: %v\n", m.selected, err)
+
+	p = tea.NewProgram(newChartModel(m.selected, explicitFileTypes))
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to run chart for %s: %v\n", m.selected, err)
 		os.Exit(1)
 	}
-
-	printDayStats(m.selected, days)
-}
-
-// printDayStats dumps the per-day, per-file-type line counts as a JSON-ish
-// map, newest day first.
-func printDayStats(repo string, days []parser.DayStats) {
-	fmt.Println(repo)
-	fmt.Println("{")
-	for i := len(days) - 1; i >= 0; i-- {
-		b, _ := json.Marshal(days[i].Types)
-		comma := ","
-		if i == 0 {
-			comma = ""
-		}
-		fmt.Printf("  %q: %s%s\n", days[i].Date, b, comma)
-	}
-	fmt.Println("}")
 }
