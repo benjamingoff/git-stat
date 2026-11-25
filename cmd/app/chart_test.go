@@ -192,3 +192,47 @@ func TestVisibleStart(t *testing.T) {
 		t.Errorf("month boundary: visibleStart = %d, want 6", got)
 	}
 }
+
+func TestSeekIndex(t *testing.T) {
+	// 10 active days, one per day from Jan 1 to Jan 10 (2024).
+	times := make([]time.Time, 10)
+	for i := range times {
+		times[i] = parseDay(fmt.Sprintf("2024-01-%02d", i+1))
+	}
+	target := func(days int) time.Time { return times[0].AddDate(0, 0, days) } // Jan 1 + N days
+
+	// Forward: first active day at/after target (Jan 8 is index 7; Jan 5+3=Jan 8 → index 7).
+	if got := seekIndex(times, 0, target(7), true); got != 7 {
+		t.Errorf("forward to Jan 8: got %d, want 7", got)
+	}
+	// Forward with no day at/after target → clamped to the last day.
+	if got := seekIndex(times, 0, times[9].AddDate(0, 1, 0), true); got != 9 {
+		t.Errorf("forward past end: got %d, want 9 (clamped to last day)", got)
+	}
+	// Forward from a mid-list cursor only looks forward.
+	if got := seekIndex(times, 5, target(7), true); got != 7 { // Jan 6 + ... wait: times[5]=Jan 6, target = Jan 1+7d = Jan 8 → index 7
+		t.Errorf("forward from cursor 5: got %d, want 7", got)
+	}
+	// Backward: last active day at/before target (Jan 4 is index 3; Jan 1+3=Jan 4 → index 3).
+	if got := seekIndex(times, 9, target(3), false); got != 3 {
+		t.Errorf("backward to Jan 4: got %d, want 3", got)
+	}
+	// Backward with no day at/before target → clamped to the first day.
+	if got := seekIndex(times, 9, times[0].AddDate(0, -1, 0), false); got != 0 {
+		t.Errorf("backward past start: got %d, want 0 (clamped to first day)", got)
+	}
+	// Backward from a mid-list cursor only looks backward.
+	if got := seekIndex(times, 5, target(3), false); got != 3 { // times[5]=Jan 6, target Jan 4 → index 3
+		t.Errorf("backward from cursor 5: got %d, want 3", got)
+	}
+	// Empty / out-of-range inputs are no-ops (cursor returned unchanged).
+	if got := seekIndex(nil, 0, target(7), true); got != 0 {
+		t.Errorf("empty times: got %d, want 0", got)
+	}
+	if got := seekIndex(times, -1, target(7), true); got != -1 {
+		t.Errorf("negative cursor: got %d, want -1", got)
+	}
+	if got := seekIndex(times, 99, target(7), true); got != 99 {
+		t.Errorf("out-of-range cursor: got %d, want 99", got)
+	}
+}

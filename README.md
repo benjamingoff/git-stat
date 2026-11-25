@@ -43,7 +43,10 @@ Chart views — `tab` cycles language chart → contributor chart → language t
 
 | key | action |
 | --- | --- |
-| ← / → (or h / l) | move the day cursor |
+| ← / → (or h / l) | move the day cursor one active day |
+| w / W | seek forward / back one week |
+| m / M | seek forward / back one month |
+| y / Y | seek forward / back one year |
 | 1–5 | range: 7d / 30d / 90d / 365d / all time |
 | tab / v | next view |
 | shift+tab | previous view |

@@ -256,7 +256,9 @@ func (m chartModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
-		switch msg.String() {
+		// Keystroke() (not String()) so shift+letter keys match as "shift+w" etc.;
+		// String() would return the shifted character itself (e.g. "W").
+		switch msg.Keystroke() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "left", "h":
@@ -267,6 +269,18 @@ func (m chartModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.fileDays)-1 {
 				m.cursor++
 			}
+		case "w":
+			m.seek(0, 0, 7, true) // forward one week
+		case "shift+w":
+			m.seek(0, 0, -7, false) // back one week
+		case "m":
+			m.seek(0, 1, 0, true) // forward one month
+		case "shift+m":
+			m.seek(0, -1, 0, false) // back one month
+		case "y":
+			m.seek(1, 0, 0, true) // forward one year
+		case "shift+y":
+			m.seek(-1, 0, 0, false) // back one year
 		case "1":
 			m.setRange(7)
 		case "2":
@@ -309,6 +323,40 @@ func (m chartModel) visibleStart() int {
 		}
 	}
 	return len(m.fileDays)
+}
+
+// seek moves the cursor to the active day at/after targetDate (forward=true) or at/before it,
+// where targetDate is `years` years / `months` months / `days` days away from the selected day.
+// The result is clamped to the first/last active day. No-op when there are no days yet.
+func (m *chartModel) seek(years, months, days int, forward bool) {
+	if len(m.times) == 0 || m.cursor < 0 || m.cursor >= len(m.times) {
+		return
+	}
+	target := m.times[m.cursor].AddDate(years, months, days)
+	m.cursor = seekIndex(m.times, m.cursor, target, forward)
+}
+
+// seekIndex returns the index to jump to when seeking from cursor toward targetDate:
+// forward=true lands on the first active day at/after target (clamped to the last day);
+// forward=false lands on the last active day at/before target (clamped to the first day).
+func seekIndex(times []time.Time, cursor int, target time.Time, forward bool) int {
+	if len(times) == 0 || cursor < 0 || cursor >= len(times) {
+		return cursor
+	}
+	if forward {
+		for i := cursor + 1; i < len(times); i++ {
+			if !times[i].Before(target) {
+				return i
+			}
+		}
+		return len(times) - 1
+	}
+	for i := cursor - 1; i >= 0; i-- {
+		if !times[i].After(target) {
+			return i
+		}
+	}
+	return 0
 }
 
 func parseDay(date string) time.Time {
@@ -501,22 +549,31 @@ func (m chartModel) title() string {
 }
 
 // footer renders the key hints that are actually meaningful in the current view.
+// The day-move and quit hints stay pinned; middle segments (seek, range, tab) are dropped
+// from the end until the line fits the terminal width.
 func (m chartModel) footer() string {
 	type hint struct{ k, label string }
-	var hints []hint
+	var mid []hint
 	if m.view == viewLangs || m.view == viewOwners {
-		hints = []hint{{"←/→", "day"}, {"1-5", "range"}, {"tab", "view"}, {"q", "quit"}}
+		mid = []hint{{"w/W", "week"}, {"m/M", "month"}, {"y/Y", "year"}, {"1-5", "range"}, {"tab", "view"}}
 	} else {
-		hints = []hint{{"←/→", "day"}, {"tab", "view"}, {"q", "quit"}}
+		mid = []hint{{"w/W", "week"}, {"m/M", "month"}, {"y/Y", "year"}, {"tab", "view"}}
 	}
-	var b strings.Builder
-	for i, h := range hints {
-		if i > 0 {
+	render := func(mid []hint) string {
+		var b strings.Builder
+		b.WriteString(keyStyle.Render("←/→") + dimStyle.Render(" day"))
+		for _, h := range mid {
 			b.WriteString(dimStyle.Render(" · "))
+			b.WriteString(keyStyle.Render(h.k) + dimStyle.Render(" "+h.label))
 		}
-		b.WriteString(keyStyle.Render(h.k) + dimStyle.Render(" "+h.label))
+		b.WriteString(dimStyle.Render(" · "))
+		b.WriteString(keyStyle.Render("q") + dimStyle.Render(" quit"))
+		return b.String()
 	}
-	return b.String()
+	for len(mid) > 0 && lipgloss.Width(render(mid)) > m.width {
+		mid = mid[:len(mid)-1] // drop the last middle segment (tab/range first) until it fits
+	}
+	return render(mid)
 }
 
 func (m chartModel) chartBarHeight() int {
