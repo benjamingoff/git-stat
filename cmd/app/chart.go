@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"image/color"
 	"math"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,96 @@ var palette = []color.Color{
 	lipgloss.Color("39"), lipgloss.Color("205"), lipgloss.Color("41"), lipgloss.Color("213"),
 	lipgloss.Color("51"), lipgloss.Color("171"), lipgloss.Color("208"), lipgloss.Color("114"),
 	lipgloss.Color("196"), lipgloss.Color("45"), lipgloss.Color("87"),
+}
+
+// Shared styles for the polished UI (tables, breakdowns, deltas, status states).
+var (
+	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	greenStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	redStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	keyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+)
+
+// formatInt renders a line count with thousands separators (1234567 -> "1,234,567").
+func formatInt(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	sign := ""
+	if n < 0 {
+		sign = "-"
+		n = -n
+	}
+	s := strconv.FormatInt(n, 10)
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte(byte(c))
+	}
+	return sign + b.String()
+}
+
+// truncate shortens s to at most w cells (ellipsis included) so it never overflows its column.
+func truncate(s string, w int) string {
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	r := []rune(s)
+	for len(r) > 0 && lipgloss.Width(string(r)+"…") > w {
+		r = r[:len(r)-1]
+	}
+	if len(r) == 0 {
+		return "…" // only when w >= 1; callers pass sane widths
+	}
+	return string(r) + "…"
+}
+
+// padRightCell pads s with spaces to w cells so columns align regardless of wide runes.
+func padRightCell(s string, w int) string {
+	if d := w - lipgloss.Width(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
+}
+
+// padLeftCell left-pads s with spaces to w cells (for right-aligned numbers).
+func padLeftCell(s string, w int) string {
+	if d := w - lipgloss.Width(s); d > 0 {
+		return strings.Repeat(" ", d) + s
+	}
+	return s
+}
+
+// deltaCell renders the change in a series between two days; prev == nil means unknown (not yet computed).
+func deltaCell(cur int64, prev *int64) string {
+	if prev == nil {
+		return dimStyle.Render("—")
+	}
+	d := cur - *prev
+	switch {
+	case d > 0:
+		return greenStyle.Render("+" + formatInt(d))
+	case d < 0:
+		return redStyle.Render("-" + formatInt(-d))
+	default:
+		return dimStyle.Render("0")
+	}
+}
+
+// allFilteredOut reports whether every snapshot has zero total lines (everything excluded by filters).
+func allFilteredOut(days []parser.DayStats) bool {
+	for _, d := range days {
+		var t int64
+		for _, v := range d.Types {
+			t += v
+		}
+		if t > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 type filesLoadedMsg struct {
@@ -63,9 +155,9 @@ type chartModel struct {
 	repo   string
 	filter *parser.Filter
 
-	fileDays   []parser.DayStats            // fast single-pass stats; ready first
-	times      []time.Time                  // parsed fileDays dates, parallel to fileDays (precomputed at load)
-	ownerByDay map[int]parser.UserDayStats  // day index -> snapshot; arrives out of order (newest first)
+	fileDays   []parser.DayStats           // fast single-pass stats; ready first
+	times      []time.Time                 // parsed fileDays dates, parallel to fileDays (precomputed at load)
+	ownerByDay map[int]parser.UserDayStats // day index -> snapshot; arrives out of order (newest first)
 
 	fileSeries  []string
 	fileColors  map[string]color.Color
@@ -297,21 +389,20 @@ func colorsFor(names []string) map[string]color.Color {
 
 func (m chartModel) View() tea.View {
 	if !m.filesLoaded {
-		return tea.NewView("Computing file stats…\n")
+		return m.statusView(lipgloss.Color("226"), "Computing file stats…", "")
 	}
 	if m.filesErr != nil {
-		return tea.NewView("Error: " + m.filesErr.Error() + "\n")
+		return m.statusView(lipgloss.Color("203"), "Error loading repository", m.filesErr.Error())
 	}
 	if len(m.fileDays) == 0 {
-		return tea.NewView("No commits found.\n")
+		return m.statusView(lipgloss.Color("226"), "No commits found", "This repository has no first-parent history to chart.")
+	}
+	if allFilteredOut(m.fileDays) {
+		return m.statusView(lipgloss.Color("226"), "All files are excluded by filters", "Check .gitstatconfig (languages / exclude_dirs) and the repo's .gitignore.")
 	}
 
 	var b strings.Builder
-	title := m.repo + " — LOC over time"
-	if m.rangeDays != 0 {
-		title += " (" + rangeLabel(m.rangeDays) + ")"
-	}
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render(title+"  ["+viewName(m.view)+"]") + "\n\n")
+	b.WriteString(m.title() + "\n\n")
 
 	visStart := m.visibleStart()
 
@@ -319,7 +410,13 @@ func (m chartModel) View() tea.View {
 	case viewLangs:
 		m.renderLegend(&b, "By language", m.fileSeries, m.fileColors)
 		m.renderStackedChart(&b, m.fileSeries, m.fileColors, m.chartBarHeight(), func(idx int) map[string]int64 { return m.fileDays[idx].Types }, visStart)
-		m.renderDayBreakdown(&b, m.fileColors, m.fileDays[m.cursor].Types)
+		var prev map[string]int64
+		hasPrev := false
+		if m.cursor > 0 {
+			prev = m.fileDays[m.cursor-1].Types
+			hasPrev = true
+		}
+		m.renderDayBreakdown(&b, m.fileColors, m.fileDays[m.cursor].Types, prev, hasPrev)
 
 	case viewOwners:
 		status := "By contributor"
@@ -336,30 +433,90 @@ func (m chartModel) View() tea.View {
 			return nil
 		}, visStart)
 		if s, ok := m.ownerByDay[m.cursor]; ok {
-			m.renderDayBreakdown(&b, m.ownerColors, s.Users)
+			var prev map[string]int64
+			hasPrev := false
+			if m.cursor > 0 {
+				if ps, pok := m.ownerByDay[m.cursor-1]; pok {
+					prev = ps.Users
+					hasPrev = true
+				}
+			}
+			m.renderDayBreakdown(&b, m.ownerColors, s.Users, prev, hasPrev)
 		} else {
-			b.WriteString("\n" + fmt.Sprintf("%s  (contributors: computing… %d/%d)", m.fileDays[m.cursor].Date, len(m.ownerByDay), len(m.fileDays)) + "\n")
+			b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("%s  (contributors: computing… %d/%d)", m.fileDays[m.cursor].Date, len(m.ownerByDay), len(m.fileDays))) + "\n")
 		}
 
 	case viewLangTable:
-		// Cumulative counts, so the last day is the current all-time state.
-		m.renderTotalTable(&b, "By language", m.fileColors, m.fileDays[len(m.fileDays)-1].Types)
+		var prev map[string]int64
+		hasPrev := false
+		if m.cursor > 0 {
+			prev = m.fileDays[m.cursor-1].Types
+			hasPrev = true
+		}
+		m.renderDayTable(&b, "By language", m.fileColors, m.fileDays[m.cursor].Types, prev, hasPrev)
 
 	case viewOwnerTable:
-		if last, ok := m.ownerByDay[len(m.fileDays)-1]; ok {
+		if s, ok := m.ownerByDay[m.cursor]; ok {
 			if m.ownersDone && m.ownersErr != nil {
-				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Render("Some days failed to compute: "+m.ownersErr.Error()) + "\n\n")
+				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Render("⚠ Some days failed to compute: "+m.ownersErr.Error()) + "\n\n")
 			}
-			m.renderTotalTable(&b, "By contributor", m.ownerColors, last.Users)
+			var prev map[string]int64
+			hasPrev := false
+			if m.cursor > 0 {
+				if ps, pok := m.ownerByDay[m.cursor-1]; pok {
+					prev = ps.Users
+					hasPrev = true
+				}
+			}
+			m.renderDayTable(&b, "By contributor", m.ownerColors, s.Users, prev, hasPrev)
 		} else if !m.ownersDone {
-			b.WriteString(fmt.Sprintf("Contributors are still computing… (%d/%d)\n", len(m.ownerByDay), len(m.fileDays)))
+			b.WriteString(dimStyle.Render(fmt.Sprintf("Contributors are still computing… %s %d/%d\n", progressBar(len(m.ownerByDay), len(m.fileDays)), len(m.ownerByDay), len(m.fileDays))))
 		} else {
-			b.WriteString("Owner computation failed: " + m.ownersErr.Error() + "\n")
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("Owner computation failed: "+m.ownersErr.Error()) + "\n")
 		}
 	}
 
-	b.WriteString("\n←/→ day · 1:1w 2:1m 3:3m 4:1y 5:all · tab view · q quit\n")
+	b.WriteString("\n" + m.footer() + "\n")
 	return tea.NewView(b.String())
+}
+
+// statusView renders a styled empty/error state instead of plain text.
+func (m chartModel) statusView(c color.Color, title string, detail string) tea.View {
+	var b strings.Builder
+	b.WriteString("\n  " + lipgloss.NewStyle().Bold(true).Foreground(c).Render(truncate(title, m.width)) + "\n")
+	if detail != "" {
+		b.WriteString("  " + dimStyle.Render(truncate(detail, m.width-2)) + "\n")
+	}
+	return tea.NewView(b.String())
+}
+
+// title renders the header line: repo basename + range label + view name, truncated to terminal width.
+func (m chartModel) title() string {
+	s := fmt.Sprintf("%s — LOC over time", filepath.Base(m.repo))
+	if m.rangeDays != 0 {
+		s += " (" + rangeLabel(m.rangeDays) + ")"
+	}
+	s += "  [" + viewName(m.view) + "]"
+	return lipgloss.NewStyle().Bold(true).Render(truncate(s, m.width))
+}
+
+// footer renders the key hints that are actually meaningful in the current view.
+func (m chartModel) footer() string {
+	type hint struct{ k, label string }
+	var hints []hint
+	if m.view == viewLangs || m.view == viewOwners {
+		hints = []hint{{"←/→", "day"}, {"1-5", "range"}, {"tab", "view"}, {"q", "quit"}}
+	} else {
+		hints = []hint{{"←/→", "day"}, {"tab", "view"}, {"q", "quit"}}
+	}
+	var b strings.Builder
+	for i, h := range hints {
+		if i > 0 {
+			b.WriteString(dimStyle.Render(" · "))
+		}
+		b.WriteString(keyStyle.Render(h.k) + dimStyle.Render(" "+h.label))
+	}
+	return b.String()
 }
 
 func (m chartModel) chartBarHeight() int {
@@ -373,22 +530,67 @@ func (m chartModel) chartBarHeight() int {
 	return h
 }
 
+// maxLegendItems caps how many series are shown in the legend; the rest collapse into "+N more".
+const maxLegendItems = 6
+
 func (m chartModel) renderLegend(b *strings.Builder, title string, series []string, colors map[string]color.Color) {
-	line := lipgloss.NewStyle().Bold(true).Render(title)
-	if len(series) > 0 {
-		var items []string
-		for _, s := range series {
-			items = append(items, lipgloss.NewStyle().Foreground(colors[s]).Render("██ "+s))
+	type legendItem struct{ disp, key string }
+	items := make([]legendItem, 0, maxLegendItems)
+	for _, s := range series {
+		if len(items) >= maxLegendItems {
+			break
 		}
-		line += "  " + strings.Join(items, "  ")
+		disp := s
+		if lipgloss.Width(disp) > 20 {
+			disp = truncate(disp, 20)
+		}
+		items = append(items, legendItem{disp: disp, key: s})
 	}
-	b.WriteString(line + "\n")
+
+	// Drop trailing items until the whole line fits the terminal width.
+	for len(items) > 0 {
+		lineW := lipgloss.Width(title) + 2 // gap after title
+		for _, it := range items {
+			lineW += 3 + lipgloss.Width(it.disp) // "██ " prefix
+		}
+		if len(items) > 1 {
+			lineW += (len(items) - 1) * 2 // separators
+		}
+		remaining := len(series) - len(items)
+		if remaining > 0 {
+			moreText := fmt.Sprintf("+%d more", remaining)
+			lineW += lipgloss.Width(moreText)
+			if len(items) > 0 {
+				lineW += 2 // gap before "+N more"
+			}
+		}
+		if lineW <= m.width {
+			break
+		}
+		items = items[:len(items)-1]
+	}
+
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(truncate(title, m.width)) + "  ")
+	for i, it := range items {
+		if i > 0 {
+			b.WriteString("  ")
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(colors[it.key]).Render("██ " + it.disp))
+	}
+	remaining := len(series) - len(items)
+	if remaining > 0 {
+		if len(items) > 0 {
+			b.WriteString("  ")
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("+%d more", remaining)))
+	}
+	b.WriteString("\n")
 }
 
 // chartColumn is one rendered column of the stacked bar chart: either a single day
 // (when there are fewer visible days than plot cells) or an aggregate bucket of days.
 type chartColumn struct {
-	dayIdx int             // absolute index into fileDays; -1 when no data in this column's range
+	dayIdx int              // absolute index into fileDays; -1 when no data in this column's range
 	values map[string]int64 // series -> lines at the end of this column's range (nil = gap: no data)
 }
 
@@ -419,7 +621,8 @@ func (m chartModel) renderStackedChart(b *strings.Builder, series []string, colo
 		return
 	}
 
-	margin := len(fmt.Sprintf("%d", maxTotal)) + 2 // y-axis label column width
+	formattedMax := formatInt(maxTotal)
+	margin := lipgloss.Width(formattedMax) + 2 // y-axis label column width
 	plotW := m.width - margin
 	if plotW < 10 {
 		plotW = 10
@@ -511,7 +714,7 @@ func (m chartModel) renderStackedChart(b *strings.Builder, series []string, colo
 	for r := 0; r < barH; r++ {
 		var row strings.Builder
 		if r == 0 {
-			row.WriteString(dimLabel.Render(fmt.Sprintf("%*s ", margin-1, fmt.Sprintf("%d", maxTotal))))
+			row.WriteString(dimLabel.Render(padLeftCell(formattedMax, margin-1) + " "))
 		} else {
 			row.WriteString(strings.Repeat(" ", margin))
 		}
@@ -707,55 +910,115 @@ func seriesByValue(values map[string]int64) []string {
 	return names
 }
 
-func (m chartModel) renderDayBreakdown(b *strings.Builder, colors map[string]color.Color, values map[string]int64) {
+// maxBreakdownRows caps how many entries the day breakdown lists; the rest collapse into "+N more".
+const maxBreakdownRows = 10
+
+func (m chartModel) renderDayBreakdown(b *strings.Builder, colors map[string]color.Color, values map[string]int64, prev map[string]int64, hasPrev bool) {
 	var total int64
 	for _, v := range values {
 		total += v
 	}
 
-	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%s  (%d lines)", m.fileDays[m.cursor].Date, total)) + "\n")
-	for _, name := range seriesByValue(values) {
-		square := lipgloss.NewStyle().Foreground(colors[name]).Render("██")
-		b.WriteString(fmt.Sprintf("  %s %-24s %d\n", square, name, values[name]))
+	date := ""
+	if m.cursor < len(m.fileDays) {
+		date = m.fileDays[m.cursor].Date
 	}
-}
-
-func (m chartModel) renderTotalTable(b *strings.Builder, title string, colors map[string]color.Color, values map[string]int64) {
-	var total int64
-	for _, v := range values {
-		total += v
-	}
-
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render(title+" — all time") + "\n\n")
+	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%s  (%s lines)", date, formatInt(total))) + "\n")
 
 	names := seriesByValue(values)
 	if len(names) == 0 {
-		b.WriteString("  (no lines)\n")
+		b.WriteString(dimStyle.Render("  (no lines)\n"))
+		return
+	}
+
+	shown := names
+	more := 0
+	if len(names) > maxBreakdownRows {
+		shown = names[:maxBreakdownRows]
+		more = len(names) - maxBreakdownRows
+	}
+
+	nameW := 0
+	for _, n := range shown {
+		if w := lipgloss.Width(n); w > nameW {
+			nameW = w
+		}
+	}
+	if nameW > 24 {
+		nameW = 24
+	}
+
+	for _, n := range shown {
+		v := values[n]
+		disp := truncate(n, nameW)
+		square := lipgloss.NewStyle().Foreground(colors[n]).Render("██ ")
+		var prevVal *int64
+		if hasPrev {
+			p := prev[n]
+			prevVal = &p
+		}
+		b.WriteString(fmt.Sprintf("  %s%s %12s  %s\n", square, padRightCell(disp, nameW), padLeftCell(formatInt(v), 12), deltaCell(v, prevVal)))
+	}
+	if more > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  +%d more\n", more)))
+	}
+}
+
+// renderDayTable shows the selected day's line counts with share % and a delta vs the previous active day.
+func (m chartModel) renderDayTable(b *strings.Builder, title string, colors map[string]color.Color, values map[string]int64, prevValues map[string]int64, hasPrev bool) {
+	var total int64
+	for _, v := range values {
+		total += v
+	}
+
+	date := ""
+	if m.cursor < len(m.fileDays) {
+		date = m.fileDays[m.cursor].Date
+	}
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%s — %s", title, date)) + "\n\n")
+
+	names := seriesByValue(values)
+	if len(names) == 0 {
+		b.WriteString(dimStyle.Render("  (no lines)\n"))
 		return
 	}
 
 	nameW := 0
 	for _, n := range names {
-		if len(n) > nameW {
-			nameW = len(n)
+		if w := lipgloss.Width(n); w > nameW {
+			nameW = w
 		}
 	}
 	if nameW > 28 {
 		nameW = 28
 	}
 
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	b.WriteString(dim.Render(fmt.Sprintf("   %-*s  %10s  %7s", nameW, "name", "lines", "share")) + "\n")
+	// Column layout: "  " + square(3) + name(nameW) + "  " + lines(12, right) + "  " + share(7) + "  " + delta.
+	b.WriteString(dimStyle.Render(fmt.Sprintf("     %s  %12s  %7s  %9s", padRightCell("name", nameW), padLeftCell("lines", 12), "share", "Δ vs prev")) + "\n")
 	for _, n := range names {
 		v := values[n]
+		disp := truncate(n, nameW)
 		share := 0.0
 		if total > 0 {
 			share = float64(v) / float64(total) * 100
 		}
 		square := lipgloss.NewStyle().Foreground(colors[n]).Render("██ ")
-		b.WriteString(fmt.Sprintf("  %s%-*s  %10d  %6.1f%%\n", square, nameW, n, v, share))
+		var prevVal *int64
+		if hasPrev {
+			p := prevValues[n]
+			prevVal = &p
+		}
+		b.WriteString(fmt.Sprintf("  %s%s  %12s  %6.1f%%  %s\n", square, padRightCell(disp, nameW), padLeftCell(formatInt(v), 12), share, deltaCell(v, prevVal)))
 	}
-	b.WriteString(dim.Render(fmt.Sprintf("   %-*s  %10d", nameW, "total", total)) + "\n")
+	var prevTotal *int64
+	if hasPrev {
+		t := int64(0)
+		for _, v := range prevValues {
+			t += v
+		}
+		prevTotal = &t
+	}
+	b.WriteString(dimStyle.Render(fmt.Sprintf("     %s  %12s", padRightCell("total", nameW), padLeftCell(formatInt(total), 12))) + "  " + deltaCell(total, prevTotal) + "\n")
 }
 
 func progressBar(done, total int) string {
