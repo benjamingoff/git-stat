@@ -76,9 +76,12 @@ func (m model) View() tea.View {
 }
 
 func main() {
-	repos := parser.GetGitDirPaths("~/Documents")
+	root := "."
+	if len(os.Args) > 1 {
+		root = os.Args[1]
+	}
 
-	p := tea.NewProgram(initialModel(repos))
+	p := tea.NewProgram(initialModel(parser.GetGitDirPaths(root)))
 	finalModel, err := p.Run()
 	if err != nil {
 		panic(err)

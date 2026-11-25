@@ -9,7 +9,7 @@ import (
 
 // DayStats holds cumulative line counts per file type at the end of a day that had commits.
 type DayStats struct {
-	Date  string // "DD-MM-YYYY"
+	Date  string // "YYYY-MM-DD"
 	Types map[string]int64
 }
 
@@ -90,8 +90,11 @@ func LocOverTime(repo string, filter *Filter) ([]DayStats, error) {
 		// "C<sha>|<date>" marker; numstat lines start with a digit or '-', so 'C' is unambiguous.
 		if strings.HasPrefix(line, "C") {
 			if i := strings.Index(line, "|"); i >= 0 {
-				flushDay(currentDay)
-				currentDay = line[i+1:]
+				nextDay := line[i+1:]
+				if nextDay != currentDay {
+					flushDay(currentDay)
+					currentDay = nextDay
+				}
 			}
 			continue
 		}
@@ -136,7 +139,7 @@ func LocOverTime(repo string, filter *Filter) ([]DayStats, error) {
 
 	out := make([]DayStats, 0, len(isos))
 	for _, iso := range isos {
-		out = append(out, DayStats{Date: flipDate(iso), Types: days[iso]})
+		out = append(out, DayStats{Date: iso, Types: days[iso]})
 	}
 	return out, nil
 }

@@ -218,7 +218,7 @@ func (m chartModel) visibleStart() int {
 }
 
 func parseDay(date string) time.Time {
-	t, err := time.Parse("02-01-2006", date) // "DD-MM-YYYY"
+	t, err := time.Parse("2006-01-02", date) // "YYYY-MM-DD"
 	if err != nil {
 		return time.Time{}
 	}
@@ -534,8 +534,8 @@ func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []
 	k := 0
 	for i := 0; i < n; i += step {
 		s := snaps[i].date
-		if len(s) >= 5 {
-			s = s[:5] // "DD-MM-YYYY" -> "DD-MM"
+		if len(s) >= 10 {
+			s = s[5:10] // "YYYY-MM-DD" -> "MM-DD"
 		}
 		start := xPos(k) - len(s)/2
 		end := start + len(s)

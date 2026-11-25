@@ -11,22 +11,15 @@ import (
 
 // UserDayStats holds per-user line ownership at the end of a day that had commits.
 type UserDayStats struct {
-	Date  string // "DD-MM-YYYY"
+	Date  string // "YYYY-MM-DD"
 	Users map[string]int64
 }
 
-// UserLocOverTime reports, for each active day, how many lines of the included
+// UserLocOverTimeProgress reports, for each active day, how many lines of the included
 // files each author owned as of that day's last commit (ownership = last commit
-// to touch the line). Each snapshot needs a full `git blame`, so days are blamed
-// concurrently and returned in chronological order.
-func UserLocOverTime(repo string, filter *Filter) ([]UserDayStats, error) {
-	return userLocOverTime(repo, filter, nil)
-}
-
-// UserLocOverTimeProgress behaves like UserLocOverTime but calls onDay with each
-// snapshot as soon as it is ready (completion order); idx is the snapshot's
-// position in the returned chronological slice. The most recent day is blamed
-// up front so it arrives first.
+// to touch the line). It calls onDay with each snapshot as soon as it is ready
+// (completion order); idx is the snapshot's position in the returned chronological
+// slice. The most recent day is blamed up front so it arrives first.
 func UserLocOverTimeProgress(repo string, filter *Filter, onDay func(done int, total int, idx int, stats UserDayStats)) ([]UserDayStats, error) {
 	return userLocOverTime(repo, filter, onDay)
 }
@@ -60,7 +53,7 @@ func userLocOverTime(repo string, filter *Filter, onDay func(int, int, int, User
 		if err != nil {
 			firstErr = err
 		} else {
-			out[total-1] = UserDayStats{Date: flipDate(days[total-1]), Users: users}
+			out[total-1] = UserDayStats{Date: days[total-1], Users: users}
 		}
 		if onDay != nil {
 			onDay(doneCount, total, total-1, out[total-1])
@@ -89,7 +82,7 @@ func userLocOverTime(repo string, filter *Filter, onDay func(int, int, int, User
 					results <- dayResult{idx: idx, err: err}
 					return
 				}
-				results <- dayResult{idx: idx, snap: UserDayStats{Date: flipDate(days[idx]), Users: users}}
+				results <- dayResult{idx: idx, snap: UserDayStats{Date: days[idx], Users: users}}
 			}
 		}()
 	}
