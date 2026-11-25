@@ -17,11 +17,7 @@ import (
 var palette = []color.Color{
 	lipgloss.Color("39"), lipgloss.Color("205"), lipgloss.Color("41"), lipgloss.Color("213"),
 	lipgloss.Color("51"), lipgloss.Color("171"), lipgloss.Color("208"), lipgloss.Color("114"),
-}
-
-type dayValues struct {
-	date   string
-	values map[string]int64
+	lipgloss.Color("196"), lipgloss.Color("45"), lipgloss.Color("87"),
 }
 
 type filesLoadedMsg struct {
@@ -44,8 +40,8 @@ type ownerRun struct {
 }
 
 const (
-	viewLangs      = iota // line graph: LOC per language over time
-	viewOwners            // line graph: LOC per contributor over time
+	viewLangs      = iota // stacked bar chart: LOC per language over time
+	viewOwners            // stacked bar chart: LOC per contributor over time
 	viewLangTable         // table: LOC per language on the selected day
 	viewOwnerTable        // table: LOC per contributor on the selected day
 )
@@ -67,8 +63,9 @@ type chartModel struct {
 	repo   string
 	filter *parser.Filter
 
-	fileDays   []parser.DayStats           // fast single-pass stats; ready first
-	ownerByDay map[int]parser.UserDayStats // day index -> snapshot; arrives out of order (newest first)
+	fileDays   []parser.DayStats            // fast single-pass stats; ready first
+	times      []time.Time                  // parsed fileDays dates, parallel to fileDays (precomputed at load)
+	ownerByDay map[int]parser.UserDayStats  // day index -> snapshot; arrives out of order (newest first)
 
 	fileSeries  []string
 	fileColors  map[string]color.Color
@@ -142,6 +139,11 @@ func (m chartModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filesLoaded = true
 		m.filesErr = msg.err
 		m.fileDays = msg.days
+		// Parse dates once at load time; the chart re-renders every frame and must not parse per cell.
+		m.times = make([]time.Time, len(msg.days))
+		for i, d := range msg.days {
+			m.times[i] = parseDay(d.Date)
+		}
 		m.buildFileSeries()
 		if msg.err != nil || len(msg.days) == 0 {
 			return m, nil
@@ -208,9 +210,9 @@ func (m chartModel) visibleStart() int {
 	if m.rangeDays == 0 || len(m.fileDays) == 0 {
 		return 0
 	}
-	cutoff := parseDay(m.fileDays[len(m.fileDays)-1].Date).AddDate(0, 0, -m.rangeDays)
-	for i, d := range m.fileDays {
-		if !parseDay(d.Date).Before(cutoff) {
+	cutoff := m.times[len(m.fileDays)-1].AddDate(0, 0, -m.rangeDays)
+	for i, t := range m.times {
+		if !t.Before(cutoff) {
 			return i
 		}
 	}
@@ -312,12 +314,11 @@ func (m chartModel) View() tea.View {
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render(title+"  ["+viewName(m.view)+"]") + "\n\n")
 
 	visStart := m.visibleStart()
-	cursorRel := m.cursor - visStart
 
 	switch m.view {
 	case viewLangs:
 		m.renderLegend(&b, "By language", m.fileSeries, m.fileColors)
-		m.renderChart(&b, fileSnapsOf(m.fileDays[visStart:]), m.fileSeries, m.fileColors, m.chartBarHeight(), cursorRel)
+		m.renderStackedChart(&b, m.fileSeries, m.fileColors, m.chartBarHeight(), func(idx int) map[string]int64 { return m.fileDays[idx].Types }, visStart)
 		m.renderDayBreakdown(&b, m.fileColors, m.fileDays[m.cursor].Types)
 
 	case viewOwners:
@@ -328,7 +329,12 @@ func (m chartModel) View() tea.View {
 			status = "Contributors failed (" + m.ownersErr.Error() + ")"
 		}
 		m.renderLegend(&b, status, m.ownerSeries, m.ownerColors)
-		m.renderChart(&b, m.ownerArrivedSnaps(visStart), m.ownerSeries, m.ownerColors, m.chartBarHeight(), m.ownerCursorRel(visStart))
+		m.renderStackedChart(&b, m.ownerSeries, m.ownerColors, m.chartBarHeight(), func(idx int) map[string]int64 {
+			if s, ok := m.ownerByDay[idx]; ok {
+				return s.Users
+			}
+			return nil
+		}, visStart)
 		if s, ok := m.ownerByDay[m.cursor]; ok {
 			m.renderDayBreakdown(&b, m.ownerColors, s.Users)
 		} else {
@@ -379,252 +385,310 @@ func (m chartModel) renderLegend(b *strings.Builder, title string, series []stri
 	b.WriteString(line + "\n")
 }
 
-type cell struct {
-	r   rune
-	c   int // series index; -1 empty, dimIdx for gridlines
-	dot bool
+// chartColumn is one rendered column of the stacked bar chart: either a single day
+// (when there are fewer visible days than plot cells) or an aggregate bucket of days.
+type chartColumn struct {
+	dayIdx int             // absolute index into fileDays; -1 when no data in this column's range
+	values map[string]int64 // series -> lines at the end of this column's range (nil = gap: no data)
 }
 
-const dimIdx = -2
-
-// renderChart draws one polyline per series stretched across the full plot width;
-// cursor is an index into snaps (-1 selects nothing).
-func (m chartModel) renderChart(b *strings.Builder, snaps []dayValues, series []string, colors map[string]color.Color, barH, cursor int) {
-	plotW := m.width - 10 // leave room for the y-axis labels
-	if plotW < 10 {
-		plotW = 10
-	}
-	n := len(snaps)
-	if n == 0 {
-		b.WriteString("  (waiting for data…)\n")
+// renderStackedChart draws a stacked bar chart of LOC over time. Columns are positioned by
+// absolute day index within the visible range, so sparse owner data shows honest gaps instead
+// of compressing missing days into a continuous line. getValues returns per-series line counts
+// for a day index (nil when that day has no data yet); series order is bottom-up stacking order.
+func (m chartModel) renderStackedChart(b *strings.Builder, series []string, colors map[string]color.Color, barH int, getValues func(idx int) map[string]int64, visStart int) {
+	n := len(m.fileDays) - visStart
+	if n <= 0 {
+		b.WriteString("  (no data)\n")
 		return
 	}
 
-	// Sample so there is at most one point per column, then stretch the
-	// points across the full plot width.
-	step := 1
-	if n > plotW {
-		step = (n + plotW - 1) / plotW
-	}
-	points := 0
-	for i := 0; i < n; i += step {
-		points++
-	}
-
-	maxTotal := int64(1)
-	for _, s := range snaps {
+	// Pass 1: the true peak across all visible days, so the scale is honest and stable as data streams in.
+	maxTotal := int64(0)
+	for i := visStart; i < len(m.fileDays); i++ {
 		var t int64
-		for _, v := range s.values {
+		for _, v := range getValues(i) {
 			t += v
 		}
 		if t > maxTotal {
 			maxTotal = t
 		}
 	}
-
-	yPos := func(v int64) int {
-		return int(float64(v) / float64(maxTotal) * float64(barH-1))
-	}
-	xPos := func(k int) int {
-		if points == 1 {
-			return plotW / 2
-		}
-		return int(math.Round(float64(k) * float64(plotW-1) / float64(points-1)))
+	if maxTotal == 0 {
+		b.WriteString("  (waiting for data…)\n")
+		return
 	}
 
-	grid := make([][]cell, barH)
-	for r := range grid {
-		grid[r] = make([]cell, plotW)
-		for c := range grid[r] {
-			grid[r][c] = cell{r: ' ', c: -1}
-		}
+	margin := len(fmt.Sprintf("%d", maxTotal)) + 2 // y-axis label column width
+	plotW := m.width - margin
+	if plotW < 10 {
+		plotW = 10
 	}
 
-	// Faint horizontal gridline at each tick; the bottom one is the axis.
-	tickRow := map[int]string{}
-	for _, t := range niceTicks(maxTotal, 5) {
-		r := yPos(t)
-		if _, ok := tickRow[r]; !ok {
-			tickRow[r] = formatTick(t)
-		}
-		ch := '·'
-		if r == 0 {
-			ch = '-'
-		}
-		for c := 0; c < plotW; c++ {
-			grid[r][c] = cell{r: ch, c: dimIdx}
+	// Columns: one per day when there is room, otherwise bucket consecutive days so each
+	// column covers at most ceil(n/plotW) days and the chart fills the width.
+	bucketSize := 1
+	if n > plotW {
+		bucketSize = (n + plotW - 1) / plotW
+	}
+	numCols := (n + bucketSize - 1) / bucketSize
+	gap := 0
+	colWidth := plotW / numCols // ≥ 1 since numCols ≤ plotW; fat columns for small ranges
+	if numCols > 1 && colWidth >= 3 {
+		// Leave a one-cell gap between fat columns so they read as distinct blocks.
+		if w := (plotW - (numCols - 1)) / numCols; w >= 2 && w < colWidth {
+			colWidth = w
+			gap = 1
 		}
 	}
+	if colWidth < 1 {
+		colWidth = 1
+		gap = 0
+	}
 
-	// Pass 1: line segments between consecutive points (later series
-	// overwrite earlier ones on overlap).
-	for si := range series {
-		name := series[si]
-		prevX, prevY, k := -1, 0, 0
-		for i := 0; i < n; i += step {
-			x := xPos(k)
-			y := yPos(snaps[i].values[name])
-			if prevX >= 0 {
-				drawLine(grid, prevX, prevY, x, y, si)
+	cols := make([]chartColumn, numCols)
+	for bIdx := 0; bIdx < numCols; bIdx++ {
+		start := visStart + bIdx*bucketSize
+		end := start + bucketSize
+		if end > len(m.fileDays) {
+			end = len(m.fileDays)
+		}
+		// The column represents the state at the end of its range: use the last day with data.
+		var values map[string]int64
+		dayIdx := -1
+		for i := start; i < end; i++ {
+			if v := getValues(i); len(v) > 0 {
+				values = v
+				dayIdx = i
 			}
-			prevX, prevY, k = x, y, k+1
+		}
+		cols[bIdx] = chartColumn{dayIdx: dayIdx, values: values}
+	}
+
+	// Grid of series indices (-1 = empty cell); row 0 is the top. Bars stack bottom-up in series order.
+	grid := make([][]int, barH)
+	for r := range grid {
+		grid[r] = make([]int, plotW)
+		for c := range grid[r] {
+			grid[r][c] = -1
 		}
 	}
 
-	for si := range series {
-		name := series[si]
-		k := 0
-		for i := 0; i < n; i += step {
-			grid[yPos(snaps[i].values[name])][xPos(k)] = cell{r: '•', c: si, dot: true}
-			k++
+	scale := float64(barH) / float64(maxTotal)
+	for bIdx, col := range cols {
+		if len(col.values) == 0 {
+			continue // honest gap: no data for this column's range
 		}
-	}
-
-	margin := 1
-	for _, l := range tickRow {
-		if len(l)+1 > margin {
-			margin = len(l) + 1
+		var total int64
+		for _, v := range col.values {
+			total += v
 		}
-	}
-
-	// The selected day snaps to the nearest drawn point.
-	selX := -1
-	if cursor >= 0 && cursor < n {
-		selX = xPos(cursor / step)
+		height := int(math.Round(float64(total) * scale))
+		if height < 1 && total > 0 {
+			height = 1 // keep tiny columns visible
+		}
+		segs := distributeHeight(col.values, series, height)
+		x0 := bIdx * (colWidth + gap)
+		row := barH - 1
+		for _, s := range segs {
+			for r := row; r > row-s.h; r-- {
+				for j := 0; j < colWidth && x0+j < plotW; j++ {
+					grid[r][x0+j] = s.idx
+				}
+			}
+			row -= s.h
+		}
 	}
 
 	styles := make([]lipgloss.Style, len(series))
-	for i, s := range series {
-		styles[i] = lipgloss.NewStyle().Foreground(colors[s])
+	for i, name := range series {
+		styles[i] = lipgloss.NewStyle().Foreground(colors[name])
 	}
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	dimLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	accent := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
 
-	for r := barH - 1; r >= 0; r-- {
+	// Rows top to bottom; one Render per color run, not per cell.
+	for r := 0; r < barH; r++ {
 		var row strings.Builder
-		if l, ok := tickRow[r]; ok {
-			row.WriteString(fmt.Sprintf("%*s ", margin-1, l))
+		if r == 0 {
+			row.WriteString(dimLabel.Render(fmt.Sprintf("%*s ", margin-1, fmt.Sprintf("%d", maxTotal))))
 		} else {
 			row.WriteString(strings.Repeat(" ", margin))
 		}
-		for c := 0; c < plotW; c++ {
-			cl := grid[r][c]
-			if cl.c == -1 {
-				row.WriteString(" ")
+		x := 0
+		for x < plotW {
+			k := grid[r][x]
+			if k == -1 {
+				start := x
+				for x < plotW && grid[r][x] == -1 {
+					x++
+				}
+				row.WriteString(strings.Repeat(" ", x-start))
 				continue
 			}
-			var st lipgloss.Style
-			switch {
-			case cl.c == dimIdx:
-				st = dim
-			case cl.dot && c == selX:
-				st = styles[cl.c].Underline(true)
-			default:
-				st = styles[cl.c]
+			start := x
+			for x < plotW && grid[r][x] == k {
+				x++
 			}
-			row.WriteString(st.Render(string(cl.r)))
+			row.WriteString(styles[k].Render(strings.Repeat("█", x-start)))
 		}
 		b.WriteString(row.String() + "\n")
 	}
 
-	label := make([]string, plotW)
-	for i := range label {
-		label[i] = " "
-	}
-	lastEnd := -1
-	k := 0
-	for i := 0; i < n; i += step {
-		s := snaps[i].date
-		if len(s) >= 10 {
-			s = s[5:10] // "YYYY-MM-DD" -> "MM-DD"
+	// Cursor guide: marker row under the chart at the selected day's column.
+	markerX := -1
+	if m.cursor >= visStart && m.cursor < len(m.fileDays) {
+		cIdx := (m.cursor - visStart) / bucketSize
+		if cIdx > numCols-1 {
+			cIdx = numCols - 1
 		}
-		start := xPos(k) - len(s)/2
-		end := start + len(s)
-		if start >= 0 && end <= plotW && start > lastEnd {
-			for j, ch := range s {
-				label[start+j] = string(ch)
+		markerX = cIdx*(colWidth+gap) + colWidth/2
+	}
+	var mrow strings.Builder
+	mrow.WriteString(strings.Repeat(" ", margin))
+	if markerX >= 0 && markerX < plotW {
+		mrow.WriteString(strings.Repeat(" ", markerX))
+		mrow.WriteString(accent.Render("▼"))
+	}
+	b.WriteString(mrow.String() + "\n")
+
+	// Date labels below the chart at evenly spaced columns; the selected day's label is bold and wins collisions.
+	type dateLabel struct {
+		start    int
+		text     string
+		selected bool
+	}
+	labels := []dateLabel{}
+	if m.cursor >= visStart && m.cursor < len(m.fileDays) {
+		cIdx := (m.cursor - visStart) / bucketSize
+		if cIdx > numCols-1 {
+			cIdx = numCols - 1
+		}
+		text := m.fileDays[m.cursor].Date // "YYYY-MM-DD"
+		if len(text) <= plotW {
+			start := cIdx*(colWidth+gap) + colWidth/2 - len(text)/2
+			if start < 0 {
+				start = 0
 			}
-			lastEnd = end
+			if start+len(text) > plotW {
+				start = plotW - len(text)
+			}
+			labels = append(labels, dateLabel{start: start, text: text, selected: true})
 		}
-		k++
 	}
-	b.WriteString(strings.Repeat(" ", margin) + strings.Join(label, "") + "\n")
+	maxLabels := plotW / 7 // MM-DD is 5 chars + gap
+	if maxLabels < 1 {
+		maxLabels = 1
+	}
+	labelEvery := (numCols + maxLabels - 1) / maxLabels
+	for j := 0; j < numCols; j += labelEvery {
+		endDay := visStart + (j+1)*bucketSize
+		if endDay > len(m.fileDays) {
+			endDay = len(m.fileDays)
+		}
+		text := m.fileDays[endDay-1].Date[5:10] // "MM-DD" of the column's last day
+		if len(text) > plotW {
+			continue
+		}
+		start := j*(colWidth+gap) + colWidth/2 - len(text)/2
+		if start < 0 {
+			start = 0
+		}
+		if start+len(text) > plotW {
+			start = plotW - len(text)
+		}
+		overlap := false
+		for _, l := range labels {
+			if start < l.start+len(l.text) && start+len(text) > l.start {
+				overlap = true
+				break
+			}
+		}
+		if !overlap {
+			labels = append(labels, dateLabel{start: start, text: text})
+		}
+	}
+	sort.Slice(labels, func(i, j int) bool { return labels[i].start < labels[j].start })
+
+	var drow strings.Builder
+	drow.WriteString(strings.Repeat(" ", margin))
+	pos := 0
+	for _, l := range labels {
+		if l.start > pos {
+			drow.WriteString(strings.Repeat(" ", l.start-pos))
+		}
+		st := dimLabel
+		if l.selected {
+			st = accent
+		}
+		drow.WriteString(st.Render(l.text))
+		pos = l.start + len(l.text)
+	}
+	b.WriteString(drow.String() + "\n")
 }
 
-// drawLine connects (x0,y0) to (x1,y1), x1 > x0, stepping one column at a
-// time with slope characters: - flat, / rising, \ falling, | steep.
-func drawLine(grid [][]cell, x0, y0, x1, y1, si int) {
-	prevY := y0
-	for x := x0 + 1; x <= x1; x++ {
-		t := float64(x-x0) / float64(x1-x0)
-		y := int(math.Round(float64(y0) + t*float64(y1-y0)))
-		dy := y - prevY
-		var ch rune
-		switch {
-		case dy == 0:
-			ch = '-'
-		case dy > 0:
-			if dy >= 2 {
-				ch = '|'
-			} else {
-				ch = '/'
-			}
-		default:
-			if dy <= -2 {
-				ch = '|'
-			} else {
-				ch = '\\'
-			}
-		}
-		r := y
-		if prevY < r {
-			r = prevY // sit on the lower cell of the step
-		}
-		if r >= 0 && r < len(grid) {
-			grid[r][x] = cell{r: ch, c: si}
-		}
-		prevY = y
-	}
+// seg is one stacked segment of a column: series index and height in rows.
+type seg struct {
+	idx int
+	h   int
 }
 
-func niceTicks(max int64, count int) []int64 {
-	if max <= 0 || count < 2 {
-		return []int64{0}
+// distributeHeight splits a column's total height across its nonzero segments proportionally,
+// using the largest-remainder method so the heights sum exactly to `height`. Segments are
+// returned in series order (bottom-up stacking).
+func distributeHeight(values map[string]int64, series []string, height int) []seg {
+	if height <= 0 {
+		return nil
 	}
-	raw := float64(max) / float64(count-1)
-	mag := math.Pow(10, math.Floor(math.Log10(raw)))
-	norm := raw / mag
-	var nice float64
-	switch {
-	case norm <= 1:
-		nice = 1
-	case norm <= 2:
-		nice = 2
-	case norm <= 5:
-		nice = 5
-	default:
-		nice = 10
+	type rawSeg struct {
+		idx  int
+		val  int64
+		frac float64
 	}
-	step := int64(nice * mag)
-	var ticks []int64
-	for v := int64(0); v <= max; v += step {
-		ticks = append(ticks, v)
-	}
-	return ticks
-}
-
-func formatTick(v int64) string {
-	switch {
-	case v >= 1_000_000:
-		return fmt.Sprintf("%.0fM", float64(v)/1e6)
-	case v >= 1000:
-		k := float64(v) / 1000
-		if k == math.Trunc(k) {
-			return fmt.Sprintf("%dk", int64(k))
+	var rs []rawSeg
+	var colTotal int64
+	for si, name := range series {
+		v := values[name]
+		if v <= 0 {
+			continue
 		}
-		return fmt.Sprintf("%.1fk", k)
-	default:
-		return fmt.Sprintf("%d", v)
+		rs = append(rs, rawSeg{idx: si, val: v})
+		colTotal += v
 	}
+	if len(rs) == 0 || colTotal == 0 {
+		return nil
+	}
+	floors := make([]int, len(rs))
+	sumFloors := 0
+	for i, r := range rs {
+		raw := float64(r.val) / float64(colTotal) * float64(height)
+		f := int(math.Floor(raw))
+		floors[i] = f
+		sumFloors += f
+		rs[i].frac = raw - float64(f)
+	}
+	remainder := height - sumFloors
+	if remainder < 0 {
+		remainder = 0
+	}
+	if remainder > len(rs) {
+		remainder = len(rs)
+	}
+	order := make([]int, len(rs))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool { return rs[order[a]].frac > rs[order[b]].frac })
+	for k := 0; k < remainder; k++ {
+		floors[order[k]]++
+	}
+	segs := make([]seg, 0, len(rs))
+	for i, r := range rs {
+		if floors[i] > 0 {
+			segs = append(segs, seg{idx: r.idx, h: floors[i]})
+		}
+	}
+	return segs
 }
 
 func seriesByValue(values map[string]int64) []string {
@@ -692,38 +756,6 @@ func (m chartModel) renderTotalTable(b *strings.Builder, title string, colors ma
 		b.WriteString(fmt.Sprintf("  %s%-*s  %10d  %6.1f%%\n", square, nameW, n, v, share))
 	}
 	b.WriteString(dim.Render(fmt.Sprintf("   %-*s  %10d", nameW, "total", total)) + "\n")
-}
-
-func fileSnapsOf(days []parser.DayStats) []dayValues {
-	out := make([]dayValues, len(days))
-	for i, d := range days {
-		out[i] = dayValues{date: d.Date, values: d.Types}
-	}
-	return out
-}
-
-func (m chartModel) ownerArrivedSnaps(visStart int) []dayValues {
-	out := make([]dayValues, 0, len(m.ownerByDay))
-	for i := visStart; i < len(m.fileDays); i++ {
-		if s, ok := m.ownerByDay[i]; ok {
-			out = append(out, dayValues{date: s.Date, values: s.Users})
-		}
-	}
-	return out
-}
-
-// ownerCursorRel is the x index of the selected day among arrived snapshots, or -1 if it has not arrived yet.
-func (m chartModel) ownerCursorRel(visStart int) int {
-	if _, ok := m.ownerByDay[m.cursor]; !ok {
-		return -1
-	}
-	pos := 0
-	for i := visStart; i < m.cursor; i++ {
-		if _, ok := m.ownerByDay[i]; ok {
-			pos++
-		}
-	}
-	return pos
 }
 
 func progressBar(done, total int) string {
