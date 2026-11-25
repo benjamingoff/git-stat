@@ -587,6 +587,43 @@ func (m chartModel) renderLegend(b *strings.Builder, title string, series []stri
 	b.WriteString("\n")
 }
 
+// chartLayout describes how visible days are packed into plot columns.
+type chartLayout struct {
+	bucketSize int // days per column (≥ 1)
+	numCols    int // number of columns
+	colWidth   int // cells per column
+	gap        int // gap cells between columns
+}
+
+// computeChartLayout packs n visible days into at most plotW cells. When there is room for one
+// column per day, each column covers a single day; otherwise consecutive days are bucketed so the
+// chart fills the width. The result always fits within plotW cells:
+// numCols*colWidth + (numCols-1)*gap ≤ plotW.
+func computeChartLayout(n, plotW int) chartLayout {
+	if n <= 0 || plotW < 1 {
+		return chartLayout{}
+	}
+	bucketSize := 1
+	if n > plotW {
+		bucketSize = (n + plotW - 1) / plotW
+	}
+	numCols := (n + bucketSize - 1) / bucketSize
+	gap := 0
+	colWidth := plotW / numCols // ≥ 1 since numCols ≤ plotW; fat columns for small ranges
+	if numCols > 1 && colWidth >= 3 {
+		// Leave a one-cell gap between fat columns so they read as distinct blocks.
+		if w := (plotW - (numCols - 1)) / numCols; w >= 2 && w < colWidth {
+			colWidth = w
+			gap = 1
+		}
+	}
+	if colWidth < 1 {
+		colWidth = 1
+		gap = 0
+	}
+	return chartLayout{bucketSize: bucketSize, numCols: numCols, colWidth: colWidth, gap: gap}
+}
+
 // chartColumn is one rendered column of the stacked bar chart: either a single day
 // (when there are fewer visible days than plot cells) or an aggregate bucket of days.
 type chartColumn struct {
@@ -630,24 +667,8 @@ func (m chartModel) renderStackedChart(b *strings.Builder, series []string, colo
 
 	// Columns: one per day when there is room, otherwise bucket consecutive days so each
 	// column covers at most ceil(n/plotW) days and the chart fills the width.
-	bucketSize := 1
-	if n > plotW {
-		bucketSize = (n + plotW - 1) / plotW
-	}
-	numCols := (n + bucketSize - 1) / bucketSize
-	gap := 0
-	colWidth := plotW / numCols // ≥ 1 since numCols ≤ plotW; fat columns for small ranges
-	if numCols > 1 && colWidth >= 3 {
-		// Leave a one-cell gap between fat columns so they read as distinct blocks.
-		if w := (plotW - (numCols - 1)) / numCols; w >= 2 && w < colWidth {
-			colWidth = w
-			gap = 1
-		}
-	}
-	if colWidth < 1 {
-		colWidth = 1
-		gap = 0
-	}
+	layout := computeChartLayout(n, plotW)
+	bucketSize, numCols, colWidth, gap := layout.bucketSize, layout.numCols, layout.colWidth, layout.gap
 
 	cols := make([]chartColumn, numCols)
 	for bIdx := 0; bIdx < numCols; bIdx++ {
